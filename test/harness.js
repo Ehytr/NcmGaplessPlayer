@@ -1,0 +1,2193 @@
+#!/usr/bin/env node
+/*
+ * GaplessPlayer 离线验证台
+ *
+ * 目的：插件不能热重载，每次试错都要重启网易云。所以先用假的运行环境把
+ *       src/main.js 完整跑一遍，验证拦截层、播放引擎、事件伪造三块逻辑。
+ *
+ * 用法：node test/harness.js
+ */
+
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+
+const MAIN = process.env.GP_SRC || path.join(__dirname, "..", "src", "main.js");
+const STARTUP =
+  process.env.GP_STARTUP || path.join(__dirname, "..", "src", "startup_script.js");
+
+/* ==================== 断言框架 ==================== */
+
+let pass = 0;
+let fail = 0;
+const failures = [];
+
+function ok(cond, label) {
+  if (cond) {
+    pass++;
+    console.log("  ✓ " + label);
+  } else {
+    fail++;
+    failures.push(label);
+    console.log("  ✗ " + label);
+  }
+}
+
+function eq(actual, expected, label) {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  ok(a === e, label + "  (期望 " + e + "，实际 " + a + ")");
+}
+
+/**
+ * 安全取事件参数。★ 变异体把事件搞没了时 `last()` 返回 null ——
+ * 直接 `last(...).args[0]` 会把验证台**整个搞崩**（退出码 2），
+ * 那样变异体是「崩了」而不是「干净报红」，报告就没法看了。
+ */
+function argsOf(ev) {
+  return (ev && ev.args) || [];
+}
+/** 取第 i 个参数；越界 / null / undefined 返回 {}（下游 `eq` 会干净地报红，不会抛错） */
+function argAt(ev, i) {
+  const a = argsOf(ev);
+  if (i >= a.length) return {};
+  // ⚠️ 不能写 `a[i] || {}` —— 那样合法的 0 / "" 会被吃掉
+  return a[i] === null || a[i] === undefined ? {} : a[i];
+}
+/** 取数组第 i 个元素；越界 / null 返回 {}（变异体把数组清空时别把验证台搞崩） */
+function at(arr, i) {
+  return arr && i < arr.length && arr[i] != null ? arr[i] : {};
+}
+/** 取数组最后一个元素；空数组返回 {} */
+function lastOf(arr) {
+  return (arr && arr.length ? arr[arr.length - 1] : null) || {};
+}
+/** 取第 i 个已启动 source 的 `onended` 回调；缺失时返回空函数
+ *  （变异体没排 source 时，直接 `.node.onended()` 会把验证台**搞崩** → 必须干净报红） */
+function enderOf(arr, i) {
+  const s = arr && i >= 0 && i < arr.length ? arr[i] : null;
+  return s && s.node && typeof s.node.onended === "function" ? s.node.onended : function () {};
+}
+/** 取第 i 个已启动 source 的节点；缺失返回 null（用于 identity 断言，别用 {}） */
+function nodeOf(arr, i) {
+  const s = arr && i >= 0 && i < arr.length ? arr[i] : null;
+  return s && s.node ? s.node : null;
+}
+
+function section(name) {
+  console.log("\n── " + name + " ──");
+}
+
+/* ==================== 假环境 ==================== */
+
+function createEnv() {
+  const emitted = []; // triggerRegisterCall 记录
+  const nativeCalls = []; // 落到「原版 channel.call」的调用
+  const started = []; // source.start 记录
+  const stopped = []; // source.stop 记录
+  const writes = []; // 日志写入
+  const intervals = []; // setInterval 回调（手动触发）
+  const timeouts = [];
+  const decoded = []; // decodeAudioData 收到的 buffer 大小
+  const meSrcCalls = []; // createMediaElementSource 收到过的元素（★ 同一元素只能调一次）
+  let startupCalls = []; // 启动阶段落到原版 channel.call 的调用
+
+  /* ---- 假的 AudioContext ---- */
+  const ctx = {
+    sampleRate: 48000,
+    currentTime: 0,
+    state: "running",
+    destination: { __node: "destination" },
+    createGain() {
+      const g = {
+        gain: { value: 1 },
+        connect() {},
+        disconnect() {},
+      };
+      ctx.__gain = g;
+      return g;
+    },
+    createAnalyser() {
+      return {
+        frequencyBinCount: 1024,
+        // ★ 默认给非零数据：真实音频的 FFT 不可能全 0。
+        //   全 0 是「被跨域静音（taint）」的判据，所以验证台要能主动造出来（ctx.__analyserZeros）。
+        getByteFrequencyData(o) {
+          if (!ctx.__analyserZeros) for (let i = 0; i < o.length; i++) o[i] = 50;
+        },
+        connect() {},
+        disconnect() {},
+      };
+    },
+    createMediaElementSource(el) {
+      meSrcCalls.push(el);
+      return { connect() {}, disconnect() {} };
+    },
+    createBufferSource() {
+      const s = {
+        buffer: null,
+        onended: null,
+        connect() {},
+        disconnect() {},
+        start(at, off) {
+          s.__started = { at, off };
+          started.push({ at, off, node: s });
+        },
+        stop() {
+          stopped.push(s);
+        },
+      };
+      return s;
+    },
+    decodeAudioData(buf) {
+      decoded.push(buf ? buf.byteLength : -1);
+      return Promise.resolve({
+        duration: 200,
+        numberOfChannels: 2,
+        sampleRate: 48000,
+        length: 9600000,
+      });
+    },
+    resume() {
+      ctx.state = "running";
+      return Promise.resolve();
+    },
+  };
+
+  /* ---- 假 performance（可控时钟，用来验证 playedTime 累计）---- */
+  const perf = {
+    _t: 1000,
+    now() {
+      return this._t;
+    },
+  };
+
+  /* ---- 假 window ---- */
+  const winListeners = {};
+  const win = {
+    AudioContext: function () {
+      return ctx;
+    },
+    betterncm_native: {},
+    // ★ v0.4.0：验证台默认强制走缓冲（`__gpStream = false`），
+    //   这样 16~43 那批「预载 / 记忆 / 窗口」老场景继续覆盖缓冲路径。
+    //   流式场景显式 `delete e.win.__gpStream` 或设成 true；另有 1 条断言盯着「不设开关时走流式」。
+    __gpStream: false,
+    addEventListener(n, fn) {
+      (winListeners[n] = winListeners[n] || []).push(fn);
+    },
+    removeEventListener(n, fn) {
+      const arr = winListeners[n] || [];
+      const i = arr.indexOf(fn);
+      if (i >= 0) arr.splice(i, 1);
+    },
+  };
+  /** 模拟用户点了一下（用来测 autoplay policy 的「等手势再起播」） */
+  function fireGesture() {
+    (winListeners.pointerdown || []).slice().forEach((fn) => fn());
+  }
+
+  /* ---- 假 <audio>（v0.4.0 流式路径）---- */
+  const audio = {
+    listeners: {},
+    instances: [],
+    last: null,
+    playReject: null, // 设成 "NotAllowedError" 就模拟 play() 被拒
+    /** 触发所有已注册的某个元素事件（loadedmetadata / ended / error） */
+    emit(name) {
+      const a = audio.last;
+      if (!a) return;
+      (audio.listeners[name] || []).slice().forEach((fn) => fn({ type: name }));
+    },
+    count(name) {
+      return (audio.listeners[name] || []).length;
+    },
+  };
+  function FakeAudio() {
+    const a = {
+      src: "",
+      preload: "",
+      volume: 1,
+      muted: false,
+      currentTime: 0,
+      duration: NaN,
+      paused: true,
+      ended: false,
+      readyState: 0,
+      error: null,
+      buffered: { length: 1, end: () => 10 },
+      seekable: { length: 1, end: () => 200 },
+      __loads: 0,
+      load() {
+        a.__loads++;
+      },
+      play() {
+        if (audio.playReject) {
+          const e = new Error("play() failed");
+          e.name = audio.playReject;
+          return Promise.reject(e);
+        }
+        a.paused = false;
+        return Promise.resolve();
+      },
+      pause() {
+        a.paused = true;
+      },
+      addEventListener(n, fn) {
+        (audio.listeners[n] = audio.listeners[n] || []).push(fn);
+      },
+      removeEventListener(n, fn) {
+        const arr = audio.listeners[n] || [];
+        const i = arr.indexOf(fn);
+        if (i >= 0) arr.splice(i, 1);
+      },
+      canPlayType() {
+        return "probably";
+      },
+      removeAttribute() {},
+    };
+    audio.instances.push(a);
+    audio.last = a;
+    return a;
+  }
+
+  /* ---- 假 fetch（★ v0.2.5：支持 AbortSignal —— 作废时要能「真的掐断」）---- */
+  const fetchLog = [];
+  const abortedFetches = []; // 被 abort 掐掉的 URL（验证「作废 = 真掐断」用）
+  function mkAbortError() {
+    const e = new Error("The operation was aborted.");
+    e.name = "AbortError";
+    return e;
+  }
+  function fetch(url, opt) {
+    fetchLog.push(url);
+    const signal = opt && opt.signal;
+    const body = {
+      status: 200,
+      type: "basic",
+      headers: { get: () => "audio/mpeg" },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(1024 * 1024)),
+    };
+    return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) {
+        abortedFetches.push(String(url));
+        return reject(mkAbortError());
+      }
+      if (signal) {
+        signal.addEventListener(
+          "abort",
+          () => {
+            abortedFetches.push(String(url));
+            reject(mkAbortError());
+          },
+          { once: true }
+        );
+      }
+      // /hang/ 的请求**永不自己兑现** —— 专门留给「作废能不能掐断在飞下载」的用例
+      if (/hang/.test(String(url))) return;
+      // 延后一个微任务再兑现，好让「同步 abort」有机会先把它拒掉
+      Promise.resolve().then(() => {
+        if (signal && signal.aborted) return; // 已经被 abort 拒了，别再兑现
+        if (/^fail/.test(String(url))) return reject(new Error("mock network down"));
+        resolve(body);
+      });
+    });
+  }
+
+  /* ---- 假 betterncm ---- */
+  const fsFiles = {}; // 假文件系统：路径 -> 文本（记忆文件、日志都写这里）
+  const betterncm = {
+    isMRBNCM: false,
+    fs: {
+      writeFile(p, blob) {
+        const text = blob && blob.parts ? blob.parts.join("") : "";
+        fsFiles[String(p)] = text;
+        // ⚠️ 只有「日志文件」才计入 writes —— logs() 取的是 writes 的最后一份快照，
+        //    要是把记忆文件也塞进来，logs() 就会返回记忆文件的内容（所有断言全乱）。
+        if (String(p).indexOf("gapless-player.log") >= 0) writes.push({ path: p, blob });
+      },
+      /** ★ v0.4.0：本地文件走流式时用它换一个可播 URL（LFP 就是这么做的） */
+      mountFile(p) {
+        return Promise.resolve("blob:mock/" + p);
+      },
+      readFile(p) {
+        const key = String(p);
+        if (Object.prototype.hasOwnProperty.call(fsFiles, key)) {
+          const s = fsFiles[key];
+          const buf = new ArrayBuffer(s.length);
+          const view = new Uint8Array(buf);
+          for (let i = 0; i < s.length; i++) view[i] = s.charCodeAt(i) & 0xff;
+          return Promise.resolve(buf);
+        }
+        if (/^missing/.test(key)) return Promise.reject(new Error("no such file"));
+        return Promise.resolve(new ArrayBuffer(2048 * 1024));
+      },
+    },
+  };
+
+  /* ---- 假 LibEAPIRequest（A1 预载查地址用）---- */
+  const eapi = {
+    log: [],
+    available: true, // isRequestAvailable() 的返回值
+    mode: "ok", // ok | nourl | fail
+    url: "http://cdn.example/next.flac",
+    eapiRequest(url, opts) {
+      this.log.push({ url, data: opts && opts.data });
+      if (this.mode === "fail") {
+        if (opts && opts.onerror) opts.onerror(new Error("mock eapi 请求失败"));
+        return;
+      }
+      const body =
+        this.mode === "nourl"
+          ? { data: [{ id: 1, url: null, br: 999000, size: 0 }] }
+          : { data: [{ id: 1, url: this.url, br: 999000, size: 12345 }] };
+      if (opts && opts.onload) opts.onload(body);
+    },
+  };
+  const loadedPlugins = {
+    LibEAPIRequest: {
+      isRequestAvailable() {
+        return eapi.available;
+      },
+      eapiRequest: (u, o) => eapi.eapiRequest(u, o),
+    },
+  };
+  const APP_CONF = { domain: "https://music.163.com", appver: "2.10.13.202675" };
+
+  /* ---- 假 legacyNativeCmder ---- */
+  const legacyNativeCmder = {
+    appended: [],
+    appendRegisterCall(name, ns, handler) {
+      this.appended.push({ name, ns, handler });
+    },
+    triggerRegisterCall(name, ns) {
+      const args = Array.prototype.slice.call(arguments, 2);
+      emitted.push({ name, ns, args });
+    },
+  };
+
+  /* ---- 假 registeredCalls（UI 的事件处理器注册表）---- */
+  const registeredCalls = {};
+  function on(event, fn) {
+    (registeredCalls[event] = registeredCalls[event] || []).push(fn);
+  }
+  win.registeredCalls = registeredCalls;
+
+  /* ---- 假 channel ---- */
+  const originalCall = function (name) {
+    nativeCalls.push({ name, args: Array.prototype.slice.call(arguments, 2) });
+  };
+  // 假的原生桥：UI 用 channel.registerCall("audioplayer.onPlayState", cb) 注册。
+  // 真机上它是 cloudmusic.dll 里 native function 包的壳；这里只记录调用。
+  const nativeRegistered = [];
+  const channel = {
+    call: originalCall,
+    registerCall(name, cb) {
+      nativeRegistered.push({ name, cb });
+    },
+  };
+
+  /* ---- 假 plugin ---- */
+  let boot = null;
+  const plugin = {
+    onLoad(fn) {
+      boot = fn;
+    },
+  };
+
+  /* ---- 假定时器 ---- */
+  const fakeSetInterval = function (fn) {
+    intervals.push(fn);
+    return intervals.length;
+  };
+  const fakeSetTimeout = function (fn) {
+    timeouts.push(fn);
+    return timeouts.length;
+  };
+
+  const localStorage = {
+    _d: {},
+    getItem(k) {
+      return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null;
+    },
+    setItem(k, v) {
+      this._d[k] = String(v);
+    },
+  };
+
+  /* ---- 装载 main.js ---- */
+  const src = fs.readFileSync(MAIN, "utf8");
+  const wrapper = new Function(
+    "window",
+    "betterncm",
+    "channel",
+    "legacyNativeCmder",
+    "registeredCalls",
+    "location",
+    "fetch",
+    "AbortController",
+    "performance",
+    "Blob",
+    "setInterval",
+    "setTimeout",
+    "plugin",
+    "localStorage",
+    "loadedPlugins",
+    "APP_CONF",
+    "Audio",
+    "console",
+    src
+  );
+
+  function FakeBlob(parts) {
+    this.parts = parts;
+  }
+
+  wrapper(
+    win,
+    betterncm,
+    channel,
+    legacyNativeCmder,
+    registeredCalls,
+    { origin: "orpheus://orpheus" },
+    fetch,
+    AbortController,
+    perf,
+    FakeBlob,
+    fakeSetInterval,
+    fakeSetTimeout,
+    plugin,
+    localStorage,
+    loadedPlugins,
+    APP_CONF,
+    FakeAudio,
+    { log() {}, warn() {}, error() {} }
+  );
+
+  return {
+    ctx,
+    channel,
+    emitted,
+    nativeCalls,
+    started,
+    stopped,
+    writes,
+    intervals,
+    timeouts,
+    decoded,
+    fetchLog,
+    originalCall,
+    betterncm,
+    win,
+    registeredCalls,
+    on,
+    legacyNativeCmder,
+    nativeRegistered,
+    audio,
+    winListeners,
+    fireGesture,
+    meSrcCalls,
+    eapi,
+    loadedPlugins,
+    APP_CONF,
+    localStorage,
+    files: fsFiles,
+    fetch,
+    perf,
+    abortedFetches,
+    boot() {
+      if (!boot) throw new Error("plugin.onLoad 没被调用");
+      boot();
+      // 启动阶段会故意调一次原版 channel.call（按住原生播放器），
+      // 单独存起来，免得干扰后面「播放命令有没有被拦下」的断言。
+      startupCalls = nativeCalls.splice(0, nativeCalls.length);
+    },
+    get startupCalls() {
+      return startupCalls;
+    },
+    /** 触发所有已注册的 interval 回调一次 */
+    tick() {
+      intervals.forEach((fn) => fn());
+    },
+    /** 触发所有已注册的 setTimeout 回调（让日志真正落盘） */
+    flushTimers() {
+      const fns = timeouts.splice(0, timeouts.length);
+      fns.forEach((fn) => fn());
+    },
+    /** 推进假时钟（performance.now()） */
+    advance(ms) {
+      perf._t += ms;
+    },
+    last(name) {
+      for (let i = emitted.length - 1; i >= 0; i--) {
+        if (emitted[i].name === name) return emitted[i];
+      }
+      return null;
+    },
+    all(name) {
+      return emitted.filter((e) => e.name === name);
+    },
+    /**
+     * 取日志内容。
+     * ⚠️ 只取**最后一次**写入 —— 插件的 flush 每次写的是整份缓冲区快照，
+     *    如果把多次快照拼起来，行数会翻倍，任何「某行出现了几次」的断言都会失效。
+     */
+    logs() {
+      if (!writes.length) return "";
+      const last = writes[writes.length - 1];
+      return last.blob && last.blob.parts ? last.blob.parts.join("") : "";
+    },
+  };
+}
+
+/** 把 promise 队列冲干净 */
+function flush(n = 8) {
+  let p = Promise.resolve();
+  for (let i = 0; i < n; i++) p = p.then(() => new Promise((r) => setImmediate(r)));
+  return p;
+}
+
+/* ==================== 用例 ==================== */
+
+async function main() {
+  console.log("GaplessPlayer 离线验证台\n====================");
+
+  /* ---------- 1. 启动与守卫 ---------- */
+  section("1. 启动与 channel.call 守卫");
+  let env = createEnv();
+  env.boot();
+
+  const locked = env.channel.call;
+  ok(typeof locked === "function", "channel.call 是函数");
+  try {
+    env.channel.call = function hijacked() {};
+  } catch (e) {
+    /* 有些实现会直接抛，也算锁住 */
+  }
+  ok(env.channel.call === locked, "★ channel.call 被锁住，外部改写无效（防 LFP 抢回）");
+
+  // 启动时必须先「按住原生播放器」，否则会和我们的 Web Audio 叠成双声道
+  eq(env.startupCalls.length, 1, "★ 启动时调用了一次原版 channel.call");
+  eq(env.startupCalls[0] && env.startupCalls[0].name, "audioplayer.pause", "★ 那次调用是 audioplayer.pause（按住原生播放器）");
+
+  env.flushTimers();
+  ok(env.logs().indexOf("GaplessPlayer") >= 0, "启动日志已写入文件");
+
+  /* ---------- 2. 加载在线歌曲 ---------- */
+  section("2. audioplayer.load（在线 FLAC）");
+  env = createEnv();
+  env.boot();
+
+  env.channel.call("audioplayer.load", null, ["AID1", { musicurl: "http://m801.x/a.flac", format: "flac", bitrate: 999, fileSize: 44 }]);
+  ok(env.fetchLog.length === 1, "fetch 被调用一次");
+  eq(env.fetchLog[0], "http://m801.x/a.flac", "fetch 的 URL 正确");
+  ok(env.nativeCalls.length === 0, "load 被拦下，没有落到原版 channel.call");
+
+  await flush();
+  eq(env.decoded.length, 1, "decodeAudioData 被调用一次");
+  const load = env.last("Load");
+  ok(!!load, "★ onLoad 已发出");
+  eq(argAt(load, 0), "AID1", "onLoad 的 audioId 正确");
+  eq(argAt(load, 1).duration, 200, "onLoad 带上了解码后的真实时长");
+  eq(argAt(load, 1).errorCode, 0, "onLoad 无错误");
+
+  /* ---------- 3. 等 UI 的 play 命令（v0.1.3 关键行为） ---------- */
+  section("3. 解码完成后【不】抢跑，等 UI 的 play 命令");
+  eq(env.started.length, 0, "★ 解码完不再立刻起播（v0.1.2 会抢跑 → 拿不到 token）");
+  env.channel.call("audioplayer.play", () => {}, ["AID1", "AID1|resume|TOK123"]);
+  eq(env.started.length, 1, "★ UI 发 play 后创建并启动 source");
+  eq(at(env.started, 0).off, 0, "从 0 秒开始");
+  const ps1 = env.last("PlayState");
+  eq(argAt(ps1, 2), 1, "★ onPlayState = 1（播放中）");
+  eq(argAt(ps1, 1), "AID1|resume|TOK123", "★★ onPlayState 第 2 参数带上了 UI 的 token（v0.1.2 缺状态段）");
+
+  /* ---------- 3b. UI 一直不发 play → 兜底起播 ---------- */
+  section("3b. UI 一直不发 play → 500ms 兜底起播");
+  let envB = createEnv();
+  envB.boot();
+  envB.channel.call("audioplayer.load", null, ["BID", { musicurl: "http://x/b.flac" }]);
+  await flush();
+  eq(envB.started.length, 0, "还没起播");
+  envB.flushTimers();
+  eq(envB.started.length, 1, "★ 兜底自动起播（避免一直不出声）");
+
+  /* ---------- 3c. ★★ emit 必须派发给 registeredCalls ---------- */
+  section("3c. ★★ emit 必须派发给 registeredCalls（UI 的处理器就挂这里）");
+  const envR = createEnv();
+  const got = [];
+  envR.on("audioplayer.onLoad", (id, payload) => got.push({ ev: "Load", id, dur: payload && payload.duration }));
+  envR.on("audioplayer.onPlayState", (id, s, n) => got.push({ ev: "PlayState", n }));
+  envR.on("audioplayer.onPlayProgress", (id, pos, lp) => got.push({ ev: "Progress", lp }));
+  envR.boot();
+  envR.channel.call("audioplayer.load", null, ["RID", { musicurl: "http://x/r.flac" }]);
+  await flush();
+  envR.channel.call("audioplayer.play", () => {}, ["RID", "RID|resume|Z"]);
+  const evNames = got.map((g) => g.ev);
+  ok(evNames.indexOf("Load") >= 0, "★ registeredCalls 收到了 onLoad");
+  ok(evNames.indexOf("PlayState") >= 0, "★ registeredCalls 收到了 onPlayState");
+  ok(evNames.indexOf("Progress") >= 0, "★ registeredCalls 收到了 onPlayProgress");
+  const rLoad = got.find((g) => g.ev === "Load") || {};
+  eq(rLoad.dur, 200, "onLoad 里带着真实时长");
+  ok(
+    got.some((g) => g.ev === "Progress" && g.lp === 1),
+    "onPlayProgress 第 3 参数是加载进度"
+  );
+
+  /* ---------- 3d. ★★ 从 appendRegisterCall 自动捕获 UI 处理器 ---------- */
+  section("3d. ★★ 自动捕获 UI 处理器（appendRegisterCall → registeredCalls）");
+  const envG = createEnv();
+  envG.boot();
+  ok(
+    typeof envG.legacyNativeCmder.appendRegisterCall.__gpWrapped === "boolean",
+    "★ appendRegisterCall 已被挂钩（兜底）"
+  );
+  // 模拟网易云 UI 注册它的处理器（真机上它就是这么注册的）
+  const uiGot = [];
+  envG.legacyNativeCmder.appendRegisterCall("Load", "audioplayer", (id, payload) => uiGot.push(["Load", id, payload && payload.duration]));
+  envG.legacyNativeCmder.appendRegisterCall("PlayState", "audioplayer", (id, s, n) => uiGot.push(["PlayState", n]));
+  ok((envG.registeredCalls["audioplayer.onLoad"] || []).length === 1, "★ onLoad 处理器被记进 registeredCalls（键名 audioplayer.onLoad）");
+  ok((envG.registeredCalls["audioplayer.onPlayState"] || []).length === 1, "★ PlayState 处理器被记进 registeredCalls");
+
+  envG.channel.call("audioplayer.load", null, ["GID", { musicurl: "http://x/g.flac" }]);
+  await flush();
+  envG.channel.call("audioplayer.play", () => {}, ["GID", "GID|resume|T"]);
+  ok(uiGot.some((g) => g[0] === "Load"), "★★ UI 的 onLoad 处理器被真的调用了");
+  ok(uiGot.some((g) => g[0] === "PlayState" && g[1] === 1), "★★ UI 的 onPlayState 处理器被真的调用了");
+
+  /* ---------- 3e. ★★ 主路径：UI 用 channel.registerCall 注册 ---------- */
+  // 真机上 UI 走的是 channel.registerCall("audioplayer.onPlayState", cb)
+  // （LFP 的 startup_script 就是包这个函数来建 registeredCalls 的）。
+  // 这条路径比 appendRegisterCall 更关键，必须单独盯住。
+  section("3e. ★★ 主路径：channel.registerCall → registeredCalls");
+  const envH = createEnv();
+  envH.boot();
+  ok(
+    typeof envH.channel.registerCall.__gpWrapped === "boolean",
+    "★ channel.registerCall 已被挂钩"
+  );
+  const uiGot2 = [];
+  envH.channel.registerCall("audioplayer.onLoad", (id, payload) => uiGot2.push(["Load", id, payload && payload.duration]));
+  envH.channel.registerCall("audioplayer.onPlayState", (id, s, n) => uiGot2.push(["PlayState", n]));
+  eq((envH.registeredCalls["audioplayer.onLoad"] || []).length, 1, "★ onLoad 处理器被记进 registeredCalls（键名原样保留）");
+  eq((envH.registeredCalls["audioplayer.onPlayState"] || []).length, 1, "★ onPlayState 处理器被记进 registeredCalls");
+  ok(
+    envH.nativeRegistered.some((r) => r.name === "audioplayer.onPlayState"),
+    "★ 原生的 registerCall 也照常收到（没把桥截断）"
+  );
+
+  envH.channel.call("audioplayer.load", null, ["HID", { musicurl: "http://x/h.flac" }]);
+  await flush();
+  envH.channel.call("audioplayer.play", () => {}, ["HID", "HID|resume|T"]);
+  ok(uiGot2.some((g) => g[0] === "Load"), "★★ UI 的 onLoad 处理器被真的调用了");
+  ok(uiGot2.some((g) => g[0] === "PlayState" && g[1] === 1), "★★ UI 的 onPlayState 处理器被真的调用了");
+
+  /* ---------- 4. 进度心跳 ---------- */
+  section("4. onPlayProgress 进度心跳");
+  const before = env.all("PlayProgress").length;
+  env.ctx.currentTime += 5;
+  env.tick();
+  const after = env.all("PlayProgress");
+  ok(after.length > before, "心跳发出了新的 onPlayProgress");
+  const pos = Number(argAt(after[after.length - 1], 1)) || 0;
+  ok(Math.abs(pos - 4.98) < 0.2, "★ 进度值跟随 AudioContext 时间（约 4.98s，实际 " + pos.toFixed(2) + "）");
+  eq(argAt(after[after.length - 1], 2), 1, "★★ 第 3 个参数是加载进度 = 1（发 0 会让网易云一直转圈、暂停失灵）");
+
+  // 位置没变时不应该重复发（照 LFP 的做法）
+  const n1 = env.all("PlayProgress").length;
+  env.tick();
+  env.tick();
+  eq(env.all("PlayProgress").length, n1, "★ 位置没变就不重复发进度");
+
+  /* ---------- 5. 暂停（A0 的核心验证点） ---------- */
+  section("5. audioplayer.pause（A0 核心验证点）");
+  env.ctx.currentTime += 10; // 播到约 15s
+  env.channel.call("audioplayer.pause", () => {}, ["", ""]);
+  ok(env.stopped.length >= 1, "★ source.stop() 被调用（音频真的停了）");
+  const ps2 = env.last("PlayState");
+  eq(argAt(ps2, 2), 2, "★ onPlayState = 2（已暂停）");
+
+  const pausedPos = env.ctx.currentTime;
+  env.ctx.currentTime += 30; // 暂停后时间流逝
+  env.tick();
+  const posAfterPause = Number(argAt(env.last("PlayProgress"), 1)) || 0;
+  ok(Math.abs(posAfterPause - 14.98) < 0.3, "★ 暂停后进度冻住不再前进（" + posAfterPause.toFixed(2) + "s）");
+
+  /* ---------- 6. 继续播放 ---------- */
+  section("6. audioplayer.play（从暂停点续播）");
+  const startCountBefore = env.started.length;
+  env.channel.call("audioplayer.play", () => {}, ["AID1", "AID1|play|"]);
+  eq(env.started.length, startCountBefore + 1, "★ 重新创建了 source");
+  const off = Number(lastOf(env.started).off) || 0;
+  ok(Math.abs(off - 14.98) < 0.3, "★ 从暂停点续播（offset ≈ 14.98，实际 " + off.toFixed(2) + "）");
+  eq(argAt(env.last("PlayState"), 2), 1, "onPlayState = 1");
+
+  /* ---------- 7. 拖动进度条 ---------- */
+  section("7. audioplayer.seek");
+  env.channel.call("audioplayer.seek", () => {}, ["AID1", "AID1|play|", 120]);
+  const seek = env.last("Seek");
+  ok(!!seek, "★ onSeek 已发出");
+  eq(argAt(seek, 3), 120, "onSeek 带上了目标位置");
+  eq(lastOf(env.started).off, 120, "★ source 从 120s 重新起播");
+
+  /* ---------- 8. 音量 ---------- */
+  section("8. audioplayer.setVolume");
+  env.channel.call("audioplayer.setVolume", () => {}, ["AID1", "AID1", 0.3]);
+  ok(Math.abs(env.ctx.__gain.gain.value - 0.3) < 1e-6, "★ GainNode 音量已改");
+  const vol = env.last("Volume");
+  eq(argAt(vol, 3), 0.3, "onVolume 已发出");
+
+  /* ---------- 9. 非播放命令必须放行 ---------- */
+  section("9. 非 audioplayer.* 命令要放行");
+  env.channel.call("playlist.play", () => {}, []);
+  env.channel.call("storage.init", () => {}, ["", "1", ""]);
+  eq(env.nativeCalls.length, 2, "★ 两条非播放命令都落到了原版 channel.call");
+  eq(at(env.nativeCalls, 0).name, "playlist.play", "放行的命令名正确");
+
+  /* ---------- 9b. 日志瘦身（v0.2.8：默认只写用得上的） ---------- */
+  section("9b. ★★ v0.2.8 日志默认不写噪音（真机里这三类占 46%）");
+  env.channel.call("player.setInfo", () => {}, [{}, 1]); // UI 设置类调用
+  env.flushTimers();
+  const logs9 = env.logs();
+  ok(logs9.indexOf("首次出现命令") < 0, "★★ 默认不写「首次出现命令」（真机里占 86 行）");
+  ok(logs9.indexOf("▶ player.setInfo") < 0, "★★ 默认不写 player.* 的 UI 设置类调用");
+  ok(logs9.indexOf("[intro]   ") < 0, "★★ 默认不写注册表逐条 dump（真机里占 31 行）");
+  ok(logs9.indexOf("▶ audioplayer.load") >= 0, "★ 但音频命令照常逐次记录（这是排查要用的）");
+  ok(logs9.indexOf("[intro] (") >= 0, "★ 注册表摘要那一行还留着");
+
+  // 打开 verbose → 噪音照常写（用全新 env，免得 seenCmds 已经记过）
+  const envV = createEnv();
+  envV.win.__gpLogVerbose = true;
+  envV.boot();
+  envV.channel.call("playlist.play", () => {}, []);
+  envV.channel.call("storage.init", () => {}, ["", "1", ""]);
+  envV.flushTimers();
+  const lgV = envV.logs();
+  ok(lgV.indexOf("首次出现命令：playlist.play") >= 0, "★ 开了 verbose 后，首次出现的命令名被记下");
+  ok(lgV.indexOf("首次出现命令：storage.init") >= 0, "★ 第二条新命令也被记下");
+  const firstCount = (lgV.match(/首次出现命令：playlist\.play/g) || []).length;
+  envV.channel.call("playlist.play", () => {}, []);
+  envV.flushTimers();
+  const secondCount = (envV.logs().match(/首次出现命令：playlist\.play/g) || []).length;
+  eq(secondCount, firstCount, "重复命令不会重复刷「首次出现」");
+
+  /* ---------- 10. 本地文件 ---------- */
+  section("10. audioplayer.load（本地文件走 readFile）");
+  env = createEnv();
+  env.boot();
+  env.channel.call("audioplayer.load", null, ["LID", { path: "E:\\music\\a.flac", format: "flac" }]);
+  ok(env.fetchLog.length === 0, "本地文件没有走 fetch");
+  await flush();
+  eq(env.decoded.length, 1, "★ readFile 的字节被送去解码");
+  eq(env.decoded[0], 2048 * 1024, "解码用的是 readFile 的字节");
+  ok(!!env.last("Load"), "onLoad 已发出");
+
+  /* ---------- 11. 网络失败要有兜底 ---------- */
+  section("11. 下载失败要有兜底");
+  env = createEnv();
+  env.boot();
+  env.channel.call("audioplayer.load", null, ["FID", { musicurl: "fail://boom" }]);
+  await flush();
+  const bad = env.last("Load");
+  ok(!!bad, "★ 失败也发了 onLoad（否则网易云会一直转圈）");
+  ok(argAt(bad, 1).errorCode !== 0, "★ onLoad 带上了错误码（" + argAt(bad, 1).errorCode + "）");
+  eq(env.started.length, 0, "失败时不启动播放");
+
+  /* ---------- 12. 切歌要丢掉上一首的残留 ---------- */
+  section("12. 快速切歌：旧加载不能污染新歌");
+  env = createEnv();
+  env.boot();
+  env.channel.call("audioplayer.load", null, ["S1", { musicurl: "http://x/1.flac" }]);
+  env.channel.call("audioplayer.load", null, ["S2", { musicurl: "http://x/2.flac" }]);
+  await flush();
+  const loads = env.all("Load");
+  eq(loads.length, 1, "★ 只有后一首有回音（前一首被 token 守卫丢弃，否则会用旧歌污染新歌）");
+  eq(argAt(at(loads, 0), 0), "S2", "★ 最终就绪的是后一首 S2");
+  eq(env.decoded.length, 1, "前一首的字节没有被送去解码");
+  env.flushTimers(); // 触发兜底起播
+  ok(env.started.length >= 1, "有 source 被启动");
+
+  /* ---------- 13. 自然播完 ---------- */
+  section("13. 自然播完要发 onEnd（含真实 playedTime）");
+  env = createEnv();
+  env.boot();
+  env.channel.call("audioplayer.load", null, ["E1", { musicurl: "http://x/e.flac" }]);
+  await flush();
+  env.flushTimers(); // 触发兜底起播
+  const srcNode = lastOf(env.started).node || { onended() {} };
+  ok(typeof srcNode.onended === "function", "source 挂了 onended");
+
+  env.advance(5000); // 假装听了 5 秒
+  srcNode.onended();
+  ok(!!env.last("End"), "★ onEnd 已发出");
+  const played = Number(argAt(env.last("End"), 1).playedTime) || 0;
+  ok(Math.abs(played - 5000) < 5, "★★ onEnd 的 playedTime 是真实播放毫秒数（约 5000，实际 " + Math.round(played) + "）");
+  eq(argAt(env.last("PlayProgress"), 1), 0, "播完后进度归零");
+
+  /* ---------- 13b. 暂停后 playedTime 要累计 ---------- */
+  section("13b. 播放 → 暂停 → 续播，playedTime 要累计");
+  env = createEnv();
+  env.boot();
+  env.channel.call("audioplayer.load", null, ["P1", { musicurl: "http://x/p.flac" }]);
+  await flush();
+  env.flushTimers(); // 触发兜底起播
+  env.advance(3000); // 听 3 秒
+  env.channel.call("audioplayer.pause", () => {}, ["", ""]);
+  env.advance(10000); // 暂停 10 秒（这段时间不该算进去）
+  env.channel.call("audioplayer.play", () => {}, ["P1", "P1"]);
+  env.advance(2000); // 再听 2 秒
+  const node2 = lastOf(env.started).node || { onended() {} };
+  node2.onended();
+  const played2 = Number(argAt(env.last("End"), 1).playedTime) || 0;
+  ok(Math.abs(played2 - 5000) < 5, "★★ 只累计真正在播的时间（3+2=5 秒，实际 " + Math.round(played2) + "ms）");
+
+  /* ---------- 14. FFT 接管 ---------- */
+  section("14. FFT / isMRBNCM 接管");
+  ok(env.betterncm.isMRBNCM === true, "★ betterncm.isMRBNCM = true");
+  ok(env.win.betterncm_native && typeof env.win.betterncm_native.audio.getFFTData === "function", "★ betterncm_native.audio.getFFTData 已接管");
+
+  /* ---------- 15. startup_script.js（真机主路径） ---------- */
+  // 真机上 startup_script.js 在页面最早期执行，把 channel.registerCall /
+  // appendRegisterCall 包一层，这样 UI 之后注册的处理器都能被记进
+  // window.registeredCalls —— 这正是 v0.1.3 缺失、导致「暂停失灵」的那一环。
+  section("15. ★★ startup_script.js（真机主路径：自建 registeredCalls）");
+  {
+    const sWin = {};
+    const sNative = []; // channel.registerCall 的透传记录
+    const sAppend = []; // appendRegisterCall 的透传记录
+    const sIntervals = [];
+    const sChannel = {
+      registerCall(name, cb) {
+        sNative.push({ name, cb });
+      },
+    };
+    const sCmder = {
+      appendRegisterCall(name, ns, handler) {
+        sAppend.push({ name, ns, handler });
+      },
+    };
+    const sSrc = fs.readFileSync(STARTUP, "utf8");
+    const sFn = new Function(
+      "window",
+      "channel",
+      "legacyNativeCmder",
+      "setInterval",
+      "clearInterval",
+      "console",
+      sSrc
+    );
+    sFn(
+      sWin,
+      sChannel,
+      sCmder,
+      (fn) => {
+        sIntervals.push(fn);
+        return sIntervals.length;
+      },
+      () => {},
+      { log() {}, warn() {}, error() {} }
+    );
+
+    ok(sWin.registeredCalls && typeof sWin.registeredCalls === "object", "★★ 自建了 window.registeredCalls");
+    ok(typeof sChannel.registerCall.__gpWrapped === "boolean", "★ channel.registerCall 被包了一层");
+    ok(typeof sCmder.appendRegisterCall.__gpWrapped === "boolean", "★ appendRegisterCall 被包了一层");
+
+    // ★ 兜底取注册表：变异体「不建 window.registeredCalls」时它会是 undefined，
+    //   直接下标访问会把验证台搞崩（退出码 2），那样就不是「干净报红」了。
+    const reg = sWin.registeredCalls || {};
+
+    // UI 走主路径注册
+    const h1 = () => {};
+    sChannel.registerCall("audioplayer.onPlayState", h1);
+    eq((reg["audioplayer.onPlayState"] || []).length, 1, "★★ UI 经 channel.registerCall 注册 → 被记进 registeredCalls");
+    eq(sNative.length, 1, "★ 原桥照常收到（没截断）");
+
+    // UI 走 appendRegisterCall 注册
+    const h2 = () => {};
+    sCmder.appendRegisterCall("Load", "audioplayer", h2);
+    eq((reg["audioplayer.onLoad"] || []).length, 1, "★★ appendRegisterCall(Load,audioplayer) → 键名 audioplayer.onLoad");
+    eq(sAppend.length, 1, "★ 原 appendRegisterCall 照常收到");
+
+    // 重复注册同一个 handler 不应重复记（幂等）
+    sChannel.registerCall("audioplayer.onPlayState", h1);
+    eq((reg["audioplayer.onPlayState"] || []).length, 1, "★ 同一个处理器重复注册不会重复记");
+  }
+
+  /* ---------- 16~25. A1 / A1.5 预载 ---------- */
+  const SONG_A = { id: "1000_1_3136952023", track_id: 1000, title: "A" };
+  const SONG_B = { id: "2000_1_3136952023", track_id: 2000, title: "B" };
+  const SONG_C = { id: "3000_1_3136952023", track_id: 3000, title: "C" };
+  const LIST = [SONG_A, SONG_B, SONG_C];
+  const isNext = (u) => /next\.flac/.test(u); // 预载走的 mock url
+  const directCount = (e) => e.fetchLog.filter((u) => !isNext(u)).length; // 「即时下载」次数
+  const askedFor = (e, id) => e.eapi.log.some((r) => String(JSON.stringify(r.data || {})).indexOf(String(id)) >= 0);
+  /**
+   * 安全读记忆文件。★ 必须容错：变异体把「写记忆」那段抠掉后文件根本不存在，
+   * 直接 JSON.parse(undefined) 会把验证台整个搞崩（退出码 2），
+   * 那样变异体是「崩了」而不是「干净报红」，报告就没法看了。
+   */
+  const memOf = (e) => {
+    try {
+      return JSON.parse(e.files[MEM_FILE] || "{}");
+    } catch (err) {
+      return {};
+    }
+  };
+
+  section("16. ★ A1.5 规则①：当前曲目未就绪 → 预载它自己（开机第一首）");
+  {
+    const e1 = createEnv();
+    e1.boot();
+    e1.channel.call("player.addListElement", null, [JSON.stringify(LIST)]); // ★ 真机就是这个形态：JSON 字符串，不是数组
+    e1.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    eq(e1.eapi.log.length, 1, "★ 向 LibEAPIRequest 发了 1 次请求");
+    const req = e1.eapi.log[0] || {}; // 用 `|| {}` 兜住：变异体要「干净地报红」而不是让验证台自己崩
+    ok(/player\/url/.test(req.url || ""), "★ 优先用 player/url 接口");
+    ok(String(JSON.stringify(req.data)).indexOf("1000") >= 0, "★★ 查的是【当前曲目】自己（track=1000），不是下一首");
+  }
+
+  section("17. ★★ A1.5 规则①命中：开机第一首秒开（跳过下载 + 解码）");
+  {
+    const e2 = createEnv();
+    e2.boot();
+    e2.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e2.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    eq(e2.fetchLog.filter(isNext).length, 1, "★ 当前曲目已经被预下过");
+    const before = directCount(e2);
+    // 开始播第一首 → 命中预载（payload 给的 url 是「另一个」，命中就不该去下它）
+    e2.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-bitrate-1999-XYZ",
+      { songId: 1000, musicurl: "http://cdn.example/A-direct.flac" },
+    ]);
+    await flush();
+    eq(directCount(e2), before, "★★ 命中预载：没有再去下载（即时下载次数没变）");
+    ok(!e2.fetchLog.some((u) => /A-direct/.test(u)), "★★ 没下载 audioplayer.load 给的 url");
+    ok(e2.all("Load").length >= 1, "★ onLoad 照常发出");
+    ok(askedFor(e2, 2000), "★ 第一首就绪后，规则②顺手预载下一首（2000）");
+  }
+
+  section("18. ★★ A1.5 规则②命中：切到下一首也秒开");
+  {
+    const e2b = createEnv();
+    e2b.boot();
+    e2b.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e2b.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    // 播第一首（命中预载）→ 触发规则②预载 2000
+    e2b.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A-direct.flac" },
+    ]);
+    await flush();
+    ok(askedFor(e2b, 2000), "（前提）2000 已被预载");
+    const before = directCount(e2b);
+    // 切到第二首：先 setCurrentPlay（真机顺序），再 load
+    e2b.channel.call("player.setCurrentPlay", null, ["2000_1_3136952023"]);
+    e2b.channel.call("audioplayer.load", null, [
+      "2000_1_3136952023-x",
+      { songId: 2000, musicurl: "http://cdn.example/B-direct.flac" },
+    ]);
+    await flush();
+    eq(directCount(e2b), before, "★★ 第二首命中预载：没再去下载");
+    ok(!e2b.fetchLog.some((u) => /B-direct/.test(u)), "★★ 没下载第二首的即时 url");
+    ok(e2b.all("Load").length >= 2, "★ 两首都发出了 onLoad");
+  }
+
+  section("19. ★ A1.5 不命中：正常即时加载");
+  {
+    const e3 = createEnv();
+    e3.boot();
+    e3.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e3.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    // 直接跳到 C（既不是预载的 1000，也不是下一首 2000）
+    e3.channel.call("audioplayer.load", null, [
+      "3000_1_3136952023-x",
+      { songId: 3000, musicurl: "http://cdn.example/C.flac" },
+    ]);
+    await flush();
+    ok(e3.fetchLog.some((u) => /C\.flac/.test(u)), "★ 没命中 → 老老实实下载");
+    ok(e3.all("Load").length >= 1, "★ onLoad 照常发出");
+  }
+
+  section("20. ★ A1.5 兜底：LibEAPIRequest 不在也不崩");
+  {
+    const e4 = createEnv();
+    e4.loadedPlugins.LibEAPIRequest = null;
+    e4.boot();
+    e4.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e4.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    eq(e4.eapi.log.length, 0, "★ 没发请求（库不在）");
+    e4.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A.flac" },
+    ]);
+    await flush();
+    ok(e4.fetchLog.some((u) => /A\.flac/.test(u)), "★★ 预载不可用时，正常加载不受影响");
+    ok(e4.all("Load").length >= 1, "★ onLoad 照常发出");
+  }
+
+  section("21. ★ A1.5 兜底：查地址失败也退回即时加载");
+  {
+    const e5 = createEnv();
+    e5.eapi.mode = "fail";
+    e5.boot();
+    e5.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e5.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    e5.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A2.flac" },
+    ]);
+    await flush();
+    ok(e5.fetchLog.some((u) => /A2\.flac/.test(u)), "★ 预载失败 → 下载了 payload 的 url");
+    ok(e5.all("Load").length >= 1, "★ onLoad 照常发出");
+  }
+
+  section("22. ★ A1.5 边界：列表末尾不预载下一首");
+  {
+    const e6 = createEnv();
+    e6.boot();
+    e6.channel.call("player.addListElement", null, [JSON.stringify([SONG_A])]);
+    e6.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    eq(e6.eapi.log.length, 1, "★ 只预载了当前曲目自己（1 次请求）");
+    e6.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A.flac" },
+    ]);
+    await flush();
+    eq(e6.eapi.log.length, 1, "★ 没有下一首 → 不再多预载（还是 1 次请求）");
+  }
+
+  section("23. ★★ A1.5 回归：列表是 JSON 字符串时也要认出来（v0.2.0 踩过的坑）");
+  {
+    // 规则①不依赖列表；真正吃列表的是规则②（算下一首）。所以这条必须走到规则②。
+    const e7 = createEnv();
+    e7.boot();
+    const raw = JSON.stringify(LIST);
+    e7.channel.call("player.addListElement", null, [raw]);
+    e7.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    ok(typeof raw === "string" && raw.length > 100, "（前提）payload 确实是长字符串");
+    e7.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A-direct.flac" },
+    ]);
+    await flush();
+    ok(askedFor(e7, 2000), "★★ 字符串形态的列表也能解析 → 算出下一首并预载（track=2000）");
+
+    // 兼容：万一是数组形态也不能坏
+    const e8 = createEnv();
+    e8.boot();
+    e8.channel.call("player.addListElement", null, [LIST]);
+    e8.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    e8.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A-direct.flac" },
+    ]);
+    await flush();
+    ok(askedFor(e8, 2000), "★ 数组形态也照常能用（防御）");
+  }
+
+  const MEM_FILE = "C:\\betterncm\\gapless-player.lasttrack.json";
+
+  section("24. ★★ A1.5 开机预载：记忆存【文件】，开机就下起来");
+  {
+    // (1) 写入：播一首 → 记忆落到文件里（不依赖 localStorage 落盘）
+    const e9 = createEnv();
+    e9.boot();
+    e9.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e9.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    ok(String(e9.files[MEM_FILE] || "").indexOf("1000") >= 0, "★★ 一选中（setCurrentPlay）就写记忆文件（不必等 load）");
+    e9.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A.flac" },
+    ]);
+    await flush();
+    const memRaw = e9.files[MEM_FILE];
+    ok(!!memRaw, "★★ 记忆写进了【文件】（真机上强杀进程也不丢）");
+    ok(String(memRaw || "").indexOf("1000") >= 0, "★★ 文件里记的是刚播的这首（track=1000）");
+    ok(String(memRaw || "").indexOf('"t"') >= 0, "★ 文件里带时间戳");
+
+    // (2) 读取：新一次启动，文件里有记忆 → 开机即预载
+    const e9b = createEnv();
+    e9b.files[MEM_FILE] = JSON.stringify({ id: 2000, t: Date.now() });
+    e9b.boot();
+    await flush();
+    eq(e9b.eapi.log.length, 1, "★★ 开机没等 setCurrentPlay 就去查地址了");
+    ok(askedFor(e9b, 2000), "★★ 查的是记忆文件里的那首（track=2000）");
+
+    // (3) 文件没有 → 退回 localStorage 备份
+    const e9c = createEnv();
+    e9c.localStorage.setItem("gaplessPlayer.lastTrack", JSON.stringify({ id: 3000, t: Date.now() }));
+    e9c.boot();
+    await flush();
+    ok(askedFor(e9c, 3000), "★ 文件读不到时，退回 localStorage 备份（track=3000）");
+
+    // (4) 记忆过期（>24h）→ 不猜
+    const e9d = createEnv();
+    e9d.files[MEM_FILE] = JSON.stringify({ id: 2000, t: Date.now() - 25 * 3600 * 1000 });
+    e9d.boot();
+    await flush();
+    eq(e9d.eapi.log.length, 0, "★ 记忆超过 24h → 不猜（等 setCurrentPlay）");
+  }
+
+  section("25. ★★ v0.2.6 开机保护窗口：网易云的「恢复」不抢记忆、也不抢预载槽");
+  {
+    // ★ 这条推翻了 v0.2.2 的一个前提（「一旦 setCurrentPlay 给出真曲目，预载槽会被换掉」）。
+    //   真机踩过（16:29 那次，全程 0 个 audioplayer.load）：
+    //     文件里是 (2758269319, 121.2s)，开机 2 秒后网易云发 setCurrentPlay(1981999919)，
+    //     我们照记 → 正确记忆被冲成 (1981999919, 0)；正确那首的预载还被掐断、白下 97MB。
+    //   根因：开机时的 setCurrentPlay 是【网易云自己恢复的歌】，不等于用户上次听的那首。
+    const MEM_SONG = { id: "9999_1_3136952023", track_id: 9999, title: "MEM" };
+    const LIST_WITH_MEM = [MEM_SONG, SONG_A, SONG_B];
+
+    const e10 = createEnv();
+    e10.files[MEM_FILE] = JSON.stringify({ id: 9999, pos: 42.5, t: Date.now() });
+    e10.boot();
+    await flush();
+    ok(askedFor(e10, 9999), "（前提）开机先按记忆预载了 9999");
+
+    // ★ 按真机顺序来：addListElement → setCurrentPlay → addListElement（网易云会发两次列表）
+    e10.channel.call("player.addListElement", null, [JSON.stringify(LIST_WITH_MEM)]);
+    e10.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]); // 网易云自己恢复的是 1000
+    await flush();
+    // ★★ 第二次 addListElement 才是「抢预载槽」的真凶：它分支里也会调 maybePreload()，
+    //    那时 S.curTrackId 若已被恢复那首污染，就会去预载它、把记忆那首掐断（真机踩过 97MB）。
+    e10.channel.call("player.addListElement", null, [JSON.stringify(LIST_WITH_MEM)]);
+    await flush();
+    e10.flushTimers();
+    const lg = e10.logs();
+    ok(lg.indexOf("开机保护窗口已开") >= 0, "★ 读到记忆后开了保护窗口");
+    ok(lg.indexOf("开机恢复（网易云自己挑的") >= 0, "★★ 认出这是开机恢复（不是用户选歌）");
+    eq(e10.eapi.log.length, 1, "★★ 没有为「网易云恢复的那首」再查一次地址（预载槽没被抢）");
+    eq(e10.abortedFetches.length, 0, "★★ 记忆那首的预载【没】被掐断");
+    eq(memOf(e10).id, 9999, "★★ 记忆文件没被覆盖（还是 9999）");
+    eq(memOf(e10).pos, 42.5, "★★ 记忆里的位置也还在");
+
+    // ★ v0.2.7：网易云恢复是**一整串**（setCurrentPlay → load → seek），
+    //   所以窗口内 load / seek **都不该**关窗、也不该写记忆。
+    e10.channel.call("audioplayer.load", null, [
+      "9999_1_3136952023-x",
+      { songId: 9999, musicurl: "http://cdn.example/MEM.flac" },
+    ]);
+    await flush();
+    e10.channel.call("audioplayer.seek", () => {}, ["9999_1_3136952023-x", "t|seek|z", 77.7]);
+    await flush();
+    e10.flushTimers();
+    ok(e10.logs().indexOf("窗口内收到 load") >= 0, "★★ 窗口内的 load 不写记忆（它也是恢复流程的一部分）");
+    eq(memOf(e10).id, 9999, "★★ 记忆仍没被覆盖（还是 9999）");
+    // ★ v0.2.9：文件是**整份没动过** —— 连老文件里带的 pos 都原样还在
+    eq(memOf(e10).pos, 42.5, "★★ 记忆文件完全没被动过（连老 pos 都还在）");
+
+    // 关窗条件①：用户主动切到【别的】歌
+    e10.channel.call("player.setCurrentPlay", null, ["2000_1_3136952023"]);
+    await flush();
+    e10.flushTimers();
+    ok(e10.logs().indexOf("用户切到别的歌") >= 0, "★★ 用户切到别的歌 → 关窗");
+    eq(memOf(e10).id, 2000, "★★ 关窗后，切歌照常记记忆");
+  }
+
+  section("26. ★★ 回归：handle() 绝不能抛错（v0.2.3 真凶：函数改名漏改调用点）");
+  {
+    // 这个坑很阴：handle() 外面套了 try/catch，抛错只会留一行日志，
+    // 而 S.playlist 在抛错【之前】已经赋值 → 预载看起来还是好的 → 验证台全绿。
+    // 所以必须单独盯「日志里有没有抛错」。
+    const e11 = createEnv();
+    e11.boot();
+    e11.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e11.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    e11.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A-direct.flac" },
+    ]);
+    await flush();
+    e11.channel.call("audioplayer.pause", null, ["", ""]);
+    await flush();
+    e11.flushTimers();
+    const lg = e11.logs();
+    ok(lg.indexOf("抛错") < 0, "★★ 日志里没有 [guard] handle(...) 抛错");
+    ok(lg.indexOf("ReferenceError") < 0, "★★ 日志里没有 ReferenceError（调用点与函数名一致）");
+  }
+
+  section("27. ★ 启动横幅版本号 == manifest.json（防止「装的是新版、横幅写旧版」）");
+  {
+    const mf = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "src", "manifest.json"), "utf8"));
+    const e12 = createEnv();
+    e12.boot();
+    e12.flushTimers();
+    ok(
+      e12.logs().indexOf("GaplessPlayer v" + mf.version) >= 0,
+      "★ 横幅版本与 manifest 一致（" + mf.version + "）"
+    );
+  }
+
+  section("28. ★★ A1.5 切歌单：开机记忆不在新歌单里 → 预载作废（不白下）");
+  {
+    // 真机踩过：开机记忆是「上一份歌单」的歌，用户切歌单后它还在下，白下 22MB。
+    const e13 = createEnv();
+    e13.files[MEM_FILE] = JSON.stringify({ id: 2000, t: Date.now() }); // 记忆 = 2000（旧歌单的歌）
+    e13.boot();
+    await flush();
+    ok(askedFor(e13, 2000), "（前提）开机先按记忆预载了 2000");
+    // 切到一个【不含 2000】的新歌单
+    const NEWLIST = [
+      { id: "5000_10_", track_id: 5000, title: "X" },
+      { id: "6000_10_", track_id: 6000, title: "Y" },
+    ];
+    e13.channel.call("player.addListElement", null, [JSON.stringify(NEWLIST)]);
+    await flush();
+    e13.flushTimers();
+    ok(e13.logs().indexOf("不在新歌单里 → 作废") >= 0, "★★ 预载作废（日志里能看到）");
+    ok(e13.logs().indexOf("预载中的 2000 在本列表=否") >= 0, "★ 列表日志标了「不在本列表」");
+    const n = e13.fetchLog.length;
+    await flush();
+    eq(e13.fetchLog.length, n, "★ 作废后不再有新的下载");
+
+    // 对照：记忆里的歌【在】歌单里 → 保留
+    const e13b = createEnv();
+    e13b.files[MEM_FILE] = JSON.stringify({ id: 2000, t: Date.now() });
+    e13b.boot();
+    await flush();
+    e13b.channel.call("player.addListElement", null, [JSON.stringify(LIST)]); // LIST 含 2000
+    e13b.flushTimers();
+    ok(e13b.logs().indexOf("预载中的 2000 在本列表=是") >= 0, "★ 记忆里的歌在歌单里 → 保留（不作废）");
+    ok(e13b.logs().indexOf("作废") < 0, "★ 没有误作废");
+  }
+
+  section("29. ★ 记忆日志：能看出是「选中」还是「加载」写的 + 心跳带记忆");
+  {
+    const e14 = createEnv();
+    e14.boot();
+    e14.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e14.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    e14.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A.flac" },
+    ]);
+    await flush();
+    e14.tick(); // 触发心跳
+    e14.flushTimers();
+    const lg = e14.logs();
+    ok(lg.indexOf("来源=选中") >= 0, "★ 选中时记了一笔（来源=选中）");
+    ok(lg.indexOf("来源=加载") >= 0, "★ 加载时记了一笔（来源=加载）");
+    ok(lg.indexOf("记忆=") >= 0, "★ 心跳里带上了「记忆=」（方便看它有没有在更新）");
+  }
+
+  /* ---------- 30~39. 记忆 payload / 掐断下载 / 保护窗口 ---------- */
+
+  section("30. ★★ v0.2.9 记忆 payload 回到 { id, t }（只记歌，不记进度）");
+  {
+    const e22 = createEnv();
+    e22.boot();
+    e22.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e22.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+    await flush();
+    const mem = memOf(e22);
+    eq(typeof mem.id, "number", "★ payload 有 id");
+    eq(typeof mem.t, "number", "★ payload 有 t");
+    eq(mem.pos, undefined, "★★ payload 里**没有** pos（v0.2.9 起不再记位置）");
+
+    // 老记忆文件里还带着 pos → 要能读，而且那个字段被**忽略**（不续播）
+    const e23 = createEnv();
+    e23.files[MEM_FILE] = JSON.stringify({ id: 2000, pos: 123.4, t: Date.now() });
+    e23.boot();
+    await flush();
+    ok(askedFor(e23, 2000), "★ 带 pos 的老记忆照样能读出来（track=2000）");
+    e23.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e23.channel.call("player.setCurrentPlay", null, ["2000_1_3136952023"]);
+    await flush();
+    e23.channel.call("audioplayer.load", null, [
+      "2000_1_3136952023-x",
+      { songId: 2000, musicurl: "http://cdn.example/B.flac" },
+    ]);
+    await flush();
+    e23.channel.call("audioplayer.play", () => {}, ["2000_1_3136952023-x", "t|resume|T"]);
+    await flush();
+    e23.flushTimers();
+    ok(/offset=0\.000/.test(e23.logs()), "★★ 老记忆里的 pos 被忽略 → 仍从 0 起播（不续播）");
+    ok(e23.logs().indexOf("开机续播") < 0, "★★ 日志里也不再有「开机续播」");
+  }
+
+  section("37. ★★ v0.2.5 作废 = 真的掐断在飞下载（AbortController）");
+  {
+    // 真机踩过：43.814 作废，45.253 那 26.76MB 还是下完了（token 只丢结果，连接照跑）。
+    const e23 = createEnv();
+    e23.eapi.url = "http://cdn.example/hang.flac"; // 这个请求永不自己返回
+    e23.files[MEM_FILE] = JSON.stringify({ id: 2000, t: Date.now() });
+    e23.boot();
+    await flush();
+    ok(e23.fetchLog.some((u) => /hang/.test(u)), "（前提）开机预载 2000 已经在下载了");
+    eq(e23.abortedFetches.length, 0, "（前提）此刻还没被掐断");
+    // 切到一个【不含 2000】的新歌单 → 作废
+    e23.channel.call("player.addListElement", null, [JSON.stringify([{ id: "5000_10_", track_id: 5000, title: "X" }])]);
+    await flush();
+    e23.flushTimers();
+    ok(e23.logs().indexOf("不在新歌单里 → 作废") >= 0, "★ 预载作废了");
+    eq(e23.abortedFetches.length, 1, "★★ 在飞的下载被真的掐断了（abort 命中 1 次）");
+    ok(e23.logs().indexOf("已掐断") >= 0, "★ 日志能看到「已掐断」");
+    ok(e23.logs().indexOf("抛错") < 0, "★ 主动掐断没有被当成错误");
+
+    // 换预载目标（不是作废）也要掐断上一个。
+    // ⚠️ v0.2.6 起必须先「真加载」过一次 —— 开机保护窗口里 setCurrentPlay 是不换预载槽的。
+    const e24 = createEnv();
+    e24.eapi.url = "http://cdn.example/hang.flac"; // 预载用的地址永不自己返回
+    e24.boot();
+    await flush();
+    e24.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e24.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A-direct.flac" },
+    ]);
+    await flush();
+    ok(e24.fetchLog.some((u) => /hang/.test(u)), "（前提）下一首的预载正在下载（且永不返回）");
+    const n0 = e24.abortedFetches.length;
+    e24.channel.call("player.setCurrentPlay", null, ["3000_1_3136952023"]); // 用户切歌 → 换预载目标
+    await flush();
+    eq(e24.abortedFetches.length, n0 + 1, "★★ 换预载目标时，上一个在飞下载也被掐断");
+  }
+
+  section("38. ★★ v0.2.7 窗口内真的听了 ≥10s → 关窗并记账（否则一直吞）");
+  {
+    const e25 = createEnv();
+    e25.files[MEM_FILE] = JSON.stringify({ id: 9999, pos: 42.5, t: Date.now() });
+    e25.boot();
+    await flush();
+    e25.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e25.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]); // 网易云恢复那首
+    await flush();
+    e25.channel.call("audioplayer.load", null, [
+      "1000_1_3136952023-x",
+      { songId: 1000, musicurl: "http://cdn.example/A-direct.flac" },
+    ]);
+    await flush();
+    e25.channel.call("audioplayer.play", () => {}, ["1000_1_3136952023-x", "t|resume|T"]);
+    await flush();
+    e25.flushTimers();
+    eq(memOf(e25).id, 9999, "（前提）刚开始播，窗口还开着，记忆没动");
+
+    // 窗口内暂停也不写记忆（v0.2.9 起暂停本来就不写）
+    e25.channel.call("audioplayer.pause", () => {}, ["1000_1_3136952023-x", "t|pause|x"]);
+    await flush();
+    e25.flushTimers();
+    eq(memOf(e25).id, 9999, "★★ 窗口内暂停 → 记忆没动（还是 9999）");
+    e25.channel.call("audioplayer.play", () => {}, ["1000_1_3136952023-x", "t|resume|T"]);
+    await flush();
+
+    e25.perf._t += 11000; // 假装连续播了 11 秒
+    e25.tick();
+    await flush();
+    e25.flushTimers();
+    ok(e25.logs().indexOf("连续播放 ≥10s") >= 0, "★★ 连续播放 ≥10s → 判定用户真在听 → 关窗");
+    eq(memOf(e25).id, 1000, "★★ 关窗并记账（track=1000）");
+  }
+
+  section("39. ★★ v0.2.9 真机正解：重启后点【自己那首】→ 关窗 + 命中预载（秒开）");
+  {
+    // 用户真正要的流程：网易云恢复它那首，用户点自己的歌 → 记忆立刻归自己，而且秒开。
+    const e26 = createEnv();
+    e26.files[MEM_FILE] = JSON.stringify({ id: 2000, t: Date.now() });
+    e26.boot();
+    await flush();
+    e26.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+    e26.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]); // 网易云恢复它自己的那首
+    await flush();
+    eq(memOf(e26).id, 2000, "（前提）窗口内记忆没被网易云的恢复冲掉");
+
+    e26.channel.call("player.setCurrentPlay", null, ["2000_1_3136952023"]); // 用户点自己那首 → 关窗
+    await flush();
+    e26.flushTimers();
+    ok(e26.logs().indexOf("用户切到别的歌") >= 0, "★★ 用户切到别的歌 → 开机保护窗口关闭");
+    eq(memOf(e26).id, 2000, "★★ 记忆还是自己那首");
+
+    // 点自己那首 → 开机预载（就是记忆那首）应该命中
+    const before = directCount(e26);
+    e26.channel.call("audioplayer.load", null, [
+      "2000_1_3136952023-x",
+      { songId: 2000, musicurl: "http://cdn.example/B-direct.flac" },
+    ]);
+    await flush();
+    e26.flushTimers();
+    ok(e26.logs().indexOf("★★ 命中！跳过下载 + 解码") >= 0, "★★ 命中开机预载 → 秒开");
+    eq(directCount(e26), before, "★★ 没再去下载（即时下载次数没变）");
+  }
+
+  /* ---------- 40~43. v0.2.10 随机播放下自适应停止「预载下一首」 ---------- */
+
+  /**
+   * 真机证据（v0.2.9，45 分钟日志 22:27~23:12）：
+   *   预载（下一首）16 次 ｜ `命中！跳过下载` **0 次** ｜ 白下 **1076 MB**（76.9 MB/首）
+   *   切歌实际等待 **平均 3482 ms**（一点没省到）
+   *   只看「自然播完 → 自动续播」的 13 次，**13 次全部没中**（预载 A、实际播到 B）
+   * → 连续 3 次押不中就停掉它，只留「预载当前曲目」（那条是知道要播才下的，有用）。
+   */
+  const S6 = [1000, 2000, 3000, 4000, 5000, 6000].map((n) => ({
+    id: n + "_1_3136952023",
+    track_id: n,
+    title: "T" + n,
+  }));
+  const LIST6 = S6;
+  const idOf = (n) => n + "_1_3136952023";
+  /** 让某首走完「选中 → 加载 → 就绪」（就绪后 maybePreload 才会跑，才看得到预载行为） */
+  async function playTrack(e, n) {
+    e.channel.call("player.setCurrentPlay", null, [idOf(n)]);
+    await flush();
+    e.channel.call("audioplayer.load", null, [
+      idOf(n) + "-x",
+      { songId: n, musicurl: "http://cdn.example/d" + n + ".flac" },
+    ]);
+    await flush();
+    e.flushTimers();
+  }
+  /** ★ 用计数差，别用 indexOf —— 日志每次 flush 是**整份缓冲区重写**，indexOf 会被前面场景污染 */
+  const countLog = (e, s) => e.logs().split(s).length - 1;
+
+  section("40. ★★ v0.2.10 随机播放：连续 3 次押不中 → 停止「预载下一首」");
+  {
+    const e40 = createEnv();
+    e40.boot();
+    await flush();
+    e40.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await playTrack(e40, 1000); // 索引 0 → 就绪后按「顺序」假设预载下一首 = 2000
+    eq(countLog(e40, "开始预载（下一首）"), 1, "（前提）按顺序假设预载了「下一首」");
+    ok(countLog(e40, "开始预载（下一首）｜ track=2000") >= 1, "（前提）预载的确实是列表里的 2000");
+
+    // 客户端「随机」挑了 3000（不是列表里的下一首 2000）→ 押不中
+    await playTrack(e40, 3000);
+    ok(countLog(e40, "✗ 预测失败 1/3") >= 1, "★ 第 1 次押不中被记下（预载 2000，实际播 3000）");
+    eq(countLog(e40, "开始预载（下一首）"), 2, "★ 还没到阈值 → 仍然预载下一首");
+
+    await playTrack(e40, 5000);
+    ok(countLog(e40, "✗ 预测失败 2/3") >= 1, "★ 第 2 次押不中被记下");
+    eq(countLog(e40, "开始预载（下一首）"), 3, "（前提）关闭前一共预载了 3 次「下一首」");
+
+    await playTrack(e40, 1000); // 第 3 次押不中 → 关
+    ok(countLog(e40, "✗ 预测失败 3/3") >= 1, "★★ 第 3 次押不中");
+    ok(countLog(e40, "停止预载下一首") >= 1, "★★ 判定「播放顺序 ≠ 列表顺序」（随机播放）→ 停止预载下一首");
+
+    // ★ v0.4.0 行为变更：判定「顺序不可预测」之后**什么都不预载** ——
+    //   这两首会走流式（浏览器边下边播），预载纯属白下，连「当前曲目」也不例外。
+    const cur0 = countLog(e40, "开始预载（当前曲目）");
+    await playTrack(e40, 2000);
+    await playTrack(e40, 4000);
+    eq(countLog(e40, "开始预载（下一首）"), 3, "★★ 关掉之后一次「下一首」预载都没有（不再白下）");
+    eq(countLog(e40, "开始预载（当前曲目）"), cur0, "★★ 连「当前曲目」也不预载了（流式兜底，预载是白下）");
+  }
+
+  section("41. ★ v0.2.10 只有「下一首」算预测：「预载当前曲目」的槽不参与押中率统计");
+  {
+    const e41 = createEnv();
+    e41.boot();
+    await flush();
+    e41.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await playTrack(e41, 1000); // 就绪后预载「下一首」= 2000
+    e41.channel.call("player.setCurrentPlay", null, [idOf(3000)]); // 押不中 1；槽换成「当前曲目」3000
+    await flush();
+    e41.flushTimers();
+    eq(countLog(e41, "✗ 预测失败"), 1, "（前提）第 1 次押不中");
+
+    // ★ 3000 还没 load/就绪，槽里是「当前曲目」3000 → 再切一首不该算「预测失败」
+    e41.channel.call("player.setCurrentPlay", null, [idOf(5000)]);
+    await flush();
+    e41.flushTimers();
+    eq(countLog(e41, "✗ 预测失败"), 1, "★★ 槽里是「当前曲目」→ 不算预测，失败次数没涨");
+    ok(countLog(e41, "✗ 预测失败 2/3") === 0, "★ 没有误记成第 2 次");
+    ok(countLog(e41, "开始预载（当前曲目）") >= 3, "★ 「当前曲目」预载照常（1000 / 3000 / 5000 各一次）");
+  }
+
+  section("42. ★★ v0.2.10 免费恢复：连续 2 首在列表里索引相邻 → 重新开启「预载下一首」");
+  {
+    const e42 = createEnv();
+    e42.boot();
+    await flush();
+    e42.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    // 先逼到「关闭」状态（一路随机挑，全押不中）
+    await playTrack(e42, 1000); // 预载 2000
+    await playTrack(e42, 3000); // 押不中 1 → 预载 4000
+    await playTrack(e42, 5000); // 押不中 2 → 预载 6000
+    await playTrack(e42, 1000); // 押不中 3 → 关闭
+    ok(countLog(e42, "停止预载下一首") >= 1, "（前提）已经关掉了");
+    eq(countLog(e42, "开始预载（下一首）"), 3, "（前提）关闭前预载了 3 次下一首");
+
+    // 现在用户切回「顺序播放」：1000(索引0) → 2000(索引1) → 3000(索引2)
+    await playTrack(e42, 2000);
+    eq(countLog(e42, "开始预载（下一首）"), 3, "★ 第 1 首相邻还不够（seqStreak=1），仍然关着");
+    eq(countLog(e42, "重新开启「预载下一首」"), 0, "★ 还没到阈值 2");
+
+    await playTrack(e42, 3000);
+    ok(countLog(e42, "重新开启「预载下一首」") >= 1, "★★ 连续 2 首索引相邻 → 判定顺序播放 → 重新开启");
+    ok(countLog(e42, "开始预载（下一首）") > 3, "★★ 恢复之后又开始预载「下一首」了（4000）");
+  }
+
+  section("43. ★ v0.2.10 修日志 bug：[list] 的「索引 / 下一首」是【当前曲目】的（原来是上一首的）");
+  {
+    const BAR = "\uFF5C"; // ｜
+    const e43 = createEnv();
+    e43.boot();
+    await flush();
+    e43.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await playTrack(e43, 1000); // 1000 在索引 0
+    e43.channel.call("player.setCurrentPlay", null, [idOf(4000)]); // 换到索引 3 的 4000
+    await flush();
+    e43.flushTimers();
+    const lg = e43.logs();
+    const want = "当前曲目 track=4000 " + BAR + " 索引=3 " + BAR + " 下一首=5000";
+    const bad = "当前曲目 track=4000 " + BAR + " 索引=0 " + BAR + " 下一首=2000";
+    ok(lg.indexOf(want) >= 0, "★★ [list] 的索引/下一首是 4000 自己的（3 / 5000）");
+    ok(lg.indexOf(bad) < 0, "★★ 不再出现「新曲目 + 上一首的索引/下一首」这种误导组合（0 / 2000）");
+  }
+
+  /* ---------- 51~60. v0.4.0 流式播放（<audio>） ---------- */
+
+  /**
+   * 验证台默认 `__gpStream = false`（让 16~43 那批老场景继续覆盖缓冲路径），
+   * 这里显式把它**删掉** —— 等价于出厂默认（不设开关 → 走流式）。
+   */
+  function streamEnv() {
+    const e = createEnv();
+    delete e.win.__gpStream;
+    return e;
+  }
+  /** 发一次流式 load（不带预载 → 必然走流式） */
+  function streamLoad(e, idStr, url) {
+    e.channel.call("audioplayer.load", null, [
+      idStr,
+      { musicurl: url, songId: Number(String(idStr).split("_")[0]) },
+    ]);
+  }
+
+  section("51. ★★ v0.4.0 没有预载 → 走流式：设 el.src + el.load()，不再下载 + 解码");
+  {
+    const e51 = streamEnv();
+    e51.boot();
+    await flush();
+    streamLoad(e51, "1000_1_3136952023", "http://cdn.example/stream-a.flac");
+    const el = e51.audio.last;
+    ok(!!el, "★★ 建了 <audio> 元素");
+    eq(el.src, "http://cdn.example/stream-a.flac", "★★ 把 musicurl 挂到了 el.src");
+    eq(el.__loads, 1, "★★ 调了 el.load()");
+    eq(e51.fetchLog.length, 0, "★★ 一条 fetch 都没有（不再整首下载）");
+    eq(e51.decoded.length, 0, "★★ decodeAudioData 也没被调（不再整首解码）");
+    await flush();
+    e51.flushTimers();
+    ok(countLog(e51, "流式播放 ｜ src=") >= 1, "★ 日志写明了走流式");
+  }
+
+  section("52. ★★ v0.4.0 onLoad 必须等 loadedmetadata（否则 UI 拿不到 duration）");
+  {
+    const e52 = streamEnv();
+    e52.boot();
+    await flush();
+    streamLoad(e52, "1000_1_3136952023", "http://cdn.example/stream-b.flac");
+    await flush();
+    eq(e52.all("Load").length, 0, "★★ metadata 还没到 → 一条 onLoad 都不发");
+
+    e52.audio.last.duration = 201.5;
+    e52.audio.emit("loadedmetadata");
+    await flush();
+    eq(e52.all("Load").length, 1, "★★ metadata 到了才发 onLoad");
+    const ld = e52.last("Load");
+    eq(argAt(ld, 1).duration, 201.5, "★★ onLoad 带上了真实时长");
+    eq(argAt(ld, 1).errorCode, 0, "★ 无错误码");
+    ok(e52.all("PlayProgress").length >= 1, "★ 顺手发了首帧进度");
+
+    // 重复 metadata 不该重复发 onLoad
+    e52.audio.emit("loadedmetadata");
+    eq(e52.all("Load").length, 1, "★ 重复的 metadata 被忽略（不重复发 onLoad）");
+  }
+
+  section("53. ★★ v0.4.0 metadata 超时兜底：8s 没来也要发 onLoad，免得 UI 一直转圈");
+  {
+    const e53 = streamEnv();
+    e53.boot();
+    await flush();
+    streamLoad(e53, "1000_1_3136952023", "http://cdn.example/stream-c.flac");
+    await flush();
+    eq(e53.all("Load").length, 0, "（前提）metadata 没来就没 onLoad");
+    e53.flushTimers(); // 触发 8s 超时
+    e53.flushTimers(); // ★ 再冲一次：超时回调是在「日志 flush」之后才写行的
+    eq(e53.all("Load").length, 1, "★★ 超时兜底发了 onLoad");
+    eq(argAt(e53.last("Load"), 1).duration, 0, "★ 兜底的 duration 是 0");
+    ok(countLog(e53, "metadata 超时") >= 1, "★ 日志说明了是超时兜底");
+  }
+
+  section("54. ★★ v0.4.0 play() 被拒（autoplay policy）→ 排队等手势，不抛未处理拒绝");
+  {
+    const e54 = streamEnv();
+    e54.boot();
+    await flush();
+    streamLoad(e54, "1000_1_3136952023", "http://cdn.example/stream-d.flac");
+    e54.audio.last.duration = 200;
+    e54.audio.emit("loadedmetadata");
+    await flush();
+
+    e54.audio.playReject = "NotAllowedError";
+    e54.channel.call("audioplayer.play", () => {}, ["1000_1_3136952023", "tok"]);
+    await flush();
+    e54.flushTimers();
+    ok(countLog(e54, "el.play() 被拒") >= 1, "★★ 记下了被拒（而不是静默失败）");
+    eq(e54.audio.last.paused, true, "★★ 被拒后不算「在播」");
+    ok(e54.winListeners.pointerdown && e54.winListeners.pointerdown.length >= 1, "★★ 挂了一次性手势监听");
+
+    // 用户点一下 → 重试起播
+    e54.audio.playReject = null;
+    e54.fireGesture();
+    await flush();
+    e54.flushTimers();
+    ok(countLog(e54, "收到用户手势 → 重试起播") >= 1, "★★ 手势到了就重试");
+    eq(e54.audio.last.paused, false, "★★ 这次真的播上了");
+    eq(e54.winListeners.pointerdown.length, 0, "★ 监听用完即摘（不残留）");
+  }
+
+  section("55. ★★ v0.4.0 切歌先摘旧事件：新歌不会收到旧歌的事件");
+  {
+    const e55 = streamEnv();
+    e55.boot();
+    await flush();
+    streamLoad(e55, "1000_1_3136952023", "http://cdn.example/s1.flac");
+    eq(e55.audio.count("loadedmetadata"), 1, "（前提）第一首挂了 1 个 metadata 监听");
+    streamLoad(e55, "2000_1_3136952023", "http://cdn.example/s2.flac");
+    eq(e55.audio.count("loadedmetadata"), 1, "★★ 换歌后还是只有 1 个（旧的被摘掉了，不会串扰）");
+    eq(e55.audio.count("ended"), 1, "★★ ended 同理");
+    eq(e55.audio.count("error"), 1, "★★ error 同理");
+    eq(e55.audio.last.src, "http://cdn.example/s2.flac", "★ src 换成了新歌");
+  }
+
+  section("56. ★★ v0.4.0 loadProgress 固定发 1（发 0 会让 UI 转圈 + 暂停失灵）");
+  {
+    const e56 = streamEnv();
+    e56.boot();
+    await flush();
+    streamLoad(e56, "1000_1_3136952023", "http://cdn.example/stream-e.flac");
+    e56.audio.last.duration = 200;
+    e56.audio.emit("loadedmetadata");
+    await flush();
+    eq(argAt(e56.last("PlayProgress"), 2), 1, "★★ 首帧进度的第 3 参是 1");
+    e56.audio.last.currentTime = 5;
+    e56.tick();
+    await flush();
+    eq(argAt(e56.last("PlayProgress"), 2), 1, "★★ 心跳里的进度第 3 参也是 1");
+    ok(argAt(e56.last("PlayProgress"), 1) > 0, "★ 位置跟随 el.currentTime");
+  }
+
+  section("57. ★★ v0.4.0 本地文件走 betterncm.fs.mountFile 拿可播 URL");
+  {
+    const e57 = streamEnv();
+    e57.boot();
+    await flush();
+    e57.channel.call("audioplayer.load", null, ["L1", { path: "C:\\x\\y.flac" }]);
+    await flush();
+    eq(e57.audio.last.src, "blob:mock/C:\\x\\y.flac", "★★ 本地文件挂的是 mountFile 给的 blob URL");
+    eq(e57.fetchLog.length, 0, "★ 没有走 fetch");
+  }
+
+  section("58. ★★ v0.4.0 createMediaElementSource 只调一次（同一元素只能调一次）");
+  {
+    const e58 = streamEnv();
+    e58.boot();
+    await flush();
+    streamLoad(e58, "1000_1_3136952023", "http://cdn.example/a1.flac");
+    streamLoad(e58, "2000_1_3136952023", "http://cdn.example/a2.flac");
+    streamLoad(e58, "3000_1_3136952023", "http://cdn.example/a3.flac");
+    await flush();
+    eq(e58.meSrcCalls.length, 1, "★★ 三次换歌，createMediaElementSource 只调了 1 次");
+    eq(e58.audio.instances.length, 1, "★★ <audio> 也只建了 1 个（复用它换 src）");
+  }
+
+  section("59. ★★ v0.4.0 静音自检：元素在走但 FFT 全 0 → 告警并退回缓冲");
+  {
+    const e59 = streamEnv();
+    e59.boot();
+    await flush();
+    streamLoad(e59, "1000_1_3136952023", "http://cdn.example/silent.flac");
+    e59.audio.last.duration = 200;
+    e59.audio.emit("loadedmetadata");
+    await flush();
+    e59.channel.call("audioplayer.play", () => {}, ["1000_1_3136952023", "tok"]);
+    await flush();
+
+    e59.audio.last.currentTime = 1;
+    e59.tick(); // 第一次只是记下基准
+    e59.ctx.__analyserZeros = true; // 造「被静音」：FFT 全 0
+    e59.audio.last.currentTime = 2;
+    e59.tick();
+    e59.audio.last.currentTime = 3;
+    e59.tick();
+    e59.flushTimers();
+    ok(countLog(e59, "疑似被跨域静音") >= 1, "★★ 连续 2s FFT 全 0 + 元素在走 → 判定被静音");
+
+    // 后续曲目自动退回缓冲路径
+    const f0 = e59.fetchLog.length;
+    streamLoad(e59, "4000_1_3136952023", "http://cdn.example/after-silent.flac");
+    await flush();
+    ok(e59.fetchLog.length > f0, "★★ 判定静音后，下一首自动改走缓冲（下载了）");
+  }
+
+  section("60. ★★ v0.4.0 出厂默认：不设 __gpStream 开关时走流式");
+  {
+    // 验证台默认把它设成 false（为了老场景覆盖缓冲路径），这里删掉 = 出厂默认
+    const e60 = streamEnv();
+    eq(e60.win.__gpStream, undefined, "（前提）开关已删除");
+    e60.boot();
+    await flush();
+    streamLoad(e60, "1000_1_3136952023", "http://cdn.example/default.flac");
+    eq(e60.audio.last.src, "http://cdn.example/default.flac", "★★ 不设开关 → 走流式");
+    eq(e60.fetchLog.length, 0, "★★ 没有走缓冲（没下载）");
+
+    // 反过来：显式关掉开关 → 强制缓冲
+    const e60b = createEnv(); // 验证台默认 __gpStream = false
+    e60b.boot();
+    await flush();
+    streamLoad(e60b, "1000_1_3136952023", "http://cdn.example/forced-buffer.flac");
+    await flush();
+    eq(e60b.audio.instances.length, 0, "★★ __gpStream=false → 连元素都不建");
+    eq(e60b.fetchLog.length, 1, "★★ 老老实实走缓冲（下载了）");
+  }
+
+  /* ---------- 61~73. v0.4.1 真无缝预约 ---------- */
+
+  /**
+   * 造一个「缓冲路径在播 + 下一首已预载就绪」的环境（还没排预约）。
+   * 默认 `__gpStream=false`（createEnv 的默认）→ 走缓冲路径，才有 start(when) 可用。
+   * @param mode  写进 localStorage 的 `NM_SETTING_PLAYER.mode`（不传就不写 → 走 seqStreak 兜底）
+   */
+  async function seamlessEnv(mode, opts) {
+    opts = opts || {};
+    const e = createEnv();
+    if (mode) e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode }));
+    if (opts.eapiUrl) e.eapi.url = opts.eapiUrl;
+    e.boot();
+    await flush();
+    const cur = opts.cur || 1000;
+    e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    e.channel.call("player.setCurrentPlay", null, [idOf(cur)]);
+    await flush();
+    e.channel.call("audioplayer.load", null, [
+      idOf(cur) + "-x",
+      { songId: cur, musicurl: "http://cdn.example/seam.flac" },
+    ]);
+    await flush();
+    await flush();
+    await flush();
+    e.channel.call("audioplayer.play", () => {}, [idOf(cur) + "-x", "t|resume|T"]);
+    await flush();
+    e.flushTimers(); // 让日志落盘（顺带把兜底起播的定时器冲掉，此时已在播 → 无害）
+    return e;
+  }
+  /** 把 ctx.currentTime 推到「距上一首结束 left 秒」的位置（buffer.duration=200、startCtxTime=0.02） */
+  function setLeft(e, left) {
+    e.ctx.currentTime = 0.02 + 200 - left;
+  }
+  /** 缓冲那一首的结束时刻（startCtxTime=0.02 + duration=200） */
+  const A_END = 200.02;
+  /**
+   * 让缓冲那一首「自然播完」：**先把 ctx 时钟推到它的结束时刻**，再触发 onended。
+   * ★ 必须推时钟 —— 否则「结束时刻估晚了 → 立刻起播」那道兜底会误触发
+   *   （真机上 `onended` 就是在 endCtxTime 那一刻来的）。
+   */
+  function endA(e) {
+    e.ctx.currentTime = A_END;
+    enderOf(e.started, 0)();
+  }
+
+  section("61. ★★ v0.4.1 顺序播放 + 下一首已就绪 → 到点前预约（start 排在结束采样上）");
+  {
+    const e = await seamlessEnv("playorder");
+    ok(countLog(e, "预载就绪（下一首）｜ track=2000") >= 1, "（前提）2000 已预载就绪");
+    const n0 = e.started.length;
+    setLeft(e, 1.0); // 距结束 ~1.0s（落在 [0.3,1.5] 窗口内）
+    e.tick();
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[sched] 预约") >= 1, "★★ 预约了（日志 [sched] 预约）");
+    eq(e.started.length, n0 + 1, "★★ 多排了一个 source（B）");
+    const s = lastOf(e.started);
+    eq(s.off, 0, "★ 预约从 0 开始");
+    ok(Math.abs(s.at - 200.02) < 0.15, "★★ start 排在「上一首的结束采样」上（at≈endCtxTime，实际 " + Number(s.at).toFixed(3) + "）");
+
+    // 再 tick 不该重复预约
+    const n1 = e.started.length;
+    e.tick();
+    await flush();
+    eq(e.started.length, n1, "★★ 已经排过 → 不重复预约");
+  }
+
+  section("62. ★★ v0.4.1 闸门：条件不满足一律不预约");
+  {
+    // (a) 下一首的预载还在飞（status=pending）→ 不预约
+    const ea = await seamlessEnv("playorder", { eapiUrl: "http://cdn.example/hang/n.flac" });
+    setLeft(ea, 1.0);
+    ea.tick();
+    await flush();
+    ea.flushTimers();
+    eq(countLog(ea, "[sched] 预约"), 0, "★★ 槽里还没 ready（在飞）→ 不预约");
+
+    // (b) 太早（还剩 2.5s）
+    const eb = await seamlessEnv("playorder");
+    setLeft(eb, 2.5);
+    eb.tick();
+    await flush();
+    eb.flushTimers();
+    eq(countLog(eb, "[sched] 预约"), 0, "★★ 还剩 2.5s（太早）→ 不预约");
+
+    // (c) 太晚（还剩 0.1s）
+    const ec = await seamlessEnv("playorder");
+    setLeft(ec, 0.1);
+    ec.tick();
+    await flush();
+    ec.flushTimers();
+    eq(countLog(ec, "[sched] 预约"), 0, "★★ 还剩 0.1s（太晚）→ 不预约");
+
+    // (d) 随机播放模式 → 不预约
+    const ed = await seamlessEnv("playrandom");
+    setLeft(ed, 1.0);
+    ed.tick();
+    await flush();
+    ed.flushTimers();
+    eq(countLog(ed, "[sched] 预约"), 0, "★★ 模式是随机播放 → 不预约");
+
+    // (e) 当前是列表最后一首（nextTrack() 为 null）→ 不预约
+    const ee = await seamlessEnv("playorder", { cur: 6000 });
+    setLeft(ee, 1.0);
+    ee.tick();
+    await flush();
+    ee.flushTimers();
+    eq(countLog(ee, "[sched] 预约"), 0, "★★ 最后一首没有下一首 → 不预约");
+  }
+
+  section("63. ★★★ v0.4.1 交接：上一首播完 → 下一首直接接上，且**绝不打断已接上的 B**");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    const bNode = nodeOf(e.started, e.started.length - 1);
+    const stopped0 = e.stopped.length;
+    const nAfter = e.started.length;
+
+    endA(e); // 上一首自然播完
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "无缝交接") >= 1, "★★ 走「无缝交接」分支");
+    ok(!!e.last("End"), "★★ [end] 已发出（UI 才会推进到下一首）");
+    ok(!!bNode && e.stopped.indexOf(bNode) < 0, "★★★ 已经接上的 B **没被停掉**（结构性不变量的核心）");
+    eq(e.started.length, nAfter, "★★ 交接没有重新 start（B 就是排好的那个）");
+    ok(e.stopped.length > stopped0, "★ 只停了上一首的 A");
+  }
+
+  section("64. ★★ v0.4.1 认领：UI 的 load 到了 → 认领（不重启、duration 用 B 的）");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    endA(e);
+    await flush();
+    const n1 = e.started.length;
+
+    e.channel.call("player.setCurrentPlay", null, [idOf(2000)]);
+    await flush();
+    e.channel.call("audioplayer.load", null, [
+      idOf(2000) + "-y",
+      { songId: 2000, musicurl: "http://cdn.example/claim.flac" },
+    ]);
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[sched] 认领") >= 1, "★★ 认领了（日志 [sched] 认领）");
+    eq(e.started.length, n1, "★★ 认领**没有**重新 start");
+    eq(argAt(e.last("Load"), 0), idOf(2000) + "-y", "★ onLoad 的 audioId 是 B 的");
+    eq(argAt(e.last("Load"), 1).duration, 200, "★ duration 是 B 的");
+  }
+
+  section("65. ★★ v0.4.1 UI 连发 3 次 play：首个补发 onPlayState(1)，后两次忽略，都不重启");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    endA(e);
+    await flush();
+    e.channel.call("player.setCurrentPlay", null, [idOf(2000)]);
+    await flush();
+    e.channel.call("audioplayer.load", null, [idOf(2000) + "-y", { songId: 2000, musicurl: "http://cdn.example/p.flac" }]);
+    await flush();
+    const n2 = e.started.length;
+    const ps0 = e.all("PlayState").length;
+
+    e.channel.call("audioplayer.play", () => {}, [idOf(2000) + "-y", "t|resume|T2"]);
+    await flush();
+    e.flushTimers();
+    eq(e.all("PlayState").length, ps0 + 1, "★★ 首个 play 补发了一条 onPlayState");
+    eq(argAt(e.last("PlayState"), 2), 1, "★ 是「播放中」");
+    eq(argAt(e.last("PlayState"), 0), idOf(2000) + "-y", "★ 用的是 B 的 audioId");
+    ok(countLog(e, "无缝认领 → 补发 onPlayState(1)") >= 1, "★ 日志说明是「认领补发」");
+
+    e.channel.call("audioplayer.play", () => {}, [idOf(2000) + "-y", "t|resume|T2"]);
+    e.channel.call("audioplayer.play", () => {}, [idOf(2000) + "-y", "t|resume|T2"]);
+    await flush();
+    e.flushTimers();
+    eq(countLog(e, "已经在播，忽略"), 2, "★ 后两次走「已经在播，忽略」");
+    eq(e.started.length, n2, "★★ 三次 play 都没重启 source");
+  }
+
+  section("66. ★★ v0.4.1 押错：预约 B 但 UI 要 C → 停掉已响的 B，随后 load(C) 走正常路径");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    const bNode = nodeOf(e.started, e.started.length - 1);
+    endA(e); // 交接 → B 已响
+    await flush();
+    e.channel.call("player.setCurrentPlay", null, [idOf(5000)]); // UI 其实要 5000
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[sched] ★ 押错") >= 1, "★★ 押错被识别并撤销");
+    ok(e.stopped.indexOf(bNode) >= 0, "★★ 已经响起来的 B 被停掉（只响了 ~21ms）");
+
+    const n = e.started.length;
+    e.channel.call("audioplayer.load", null, [idOf(5000) + "-z", { songId: 5000, musicurl: "http://cdn.example/c5.flac" }]);
+    await flush();
+    e.flushTimers();
+    ok(e.started.length > n, "★ 随后 load(5000) 走正常路径（重新起播）");
+  }
+
+  section("67. ★ v0.4.1 撤销-暂停：排上的 B 不会到点自己响");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    const bNode = nodeOf(e.started, e.started.length - 1);
+    e.channel.call("audioplayer.pause", () => {}, ["", ""]);
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[sched] 撤销") >= 1, "★★ 暂停撤销了预约");
+    ok(e.stopped.indexOf(bNode) >= 0, "★★ 排上的 B 被停掉（不会到点自己响）");
+  }
+
+  section("68. ★ v0.4.1 撤销-拖动：预约作废，新 source 从拖动位置起");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    const bNode = nodeOf(e.started, e.started.length - 1);
+    e.channel.call("audioplayer.seek", () => {}, ["", "", 10]);
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[sched] 撤销") >= 1, "★★ 拖动撤销了预约");
+    ok(e.stopped.indexOf(bNode) >= 0, "★★ 排上的 B 被停掉");
+    eq(lastOf(e.started).off, 10, "★ 新的 source 从 10s 起播");
+  }
+
+  section("69. ★ v0.4.1 撤销-切歌单（addListElement）");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    const bNode = nodeOf(e.started, e.started.length - 1);
+    e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[sched] 撤销") >= 1, "★★ 切歌单撤销了预约");
+    ok(e.stopped.indexOf(bNode) >= 0, "★★ 排上的 B 被停掉");
+  }
+
+  section("70. ★ v0.4.1 撤销-audioplayer.stop：仍照旧放行给原生");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    const bNode = nodeOf(e.started, e.started.length - 1);
+    e.channel.call("audioplayer.stop", () => {}, [idOf(1000)]);
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[sched] 撤销") >= 1, "★★ UI 的 stop 撤销了预约");
+    ok(e.stopped.indexOf(bNode) >= 0, "★★ 排上的 B 被停掉");
+    ok(e.nativeCalls.some((c) => c.name === "audioplayer.stop"), "★★ 但这条命令**仍放行**给原生");
+  }
+
+  section("71. ★★ v0.4.1 playedMs 归属：交接后只给 B 计时（onEnd 不含 A 的时间）");
+  {
+    const e = await seamlessEnv("playorder");
+    e.advance(4000); // A 已经听了 4 秒
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    endA(e); // 交接
+    await flush();
+    const aPlayed = Number(argAt(e.last("End"), 1).playedTime) || 0;
+    ok(Math.abs(aPlayed - 4000) < 50, "★★ A 的 onEnd.playedTime ≈ 4000（含它自己那段）");
+
+    e.advance(3000); // B 听了 3 秒
+    enderOf(e.started, e.started.length - 1)(); // B 播完
+    const bPlayed = Number(argAt(e.last("End"), 1).playedTime) || 0;
+    ok(Math.abs(bPlayed - 3000) < 50, "★★ B 的 onEnd.playedTime ≈ 3000（不含 A 的 4 秒，实际 " + Math.round(bPlayed) + "）");
+  }
+
+  section("72. ★★ v0.4.1 live 窗口抑制进度（避免进度条从 0 闪一下）");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    endA(e); // 交接 → phase=live
+    await flush();
+    const p0 = e.all("PlayProgress").length;
+    e.tick();
+    await flush();
+    eq(e.all("PlayProgress").length, p0, "★★ live 窗口内不发进度（UI 不会看到位置跳回 0）");
+  }
+
+  section("73. ★★ v0.4.1 peek 不消费预载槽：认领不重复下载、押中率统计照常");
+  {
+    const e = await seamlessEnv("playorder");
+    setLeft(e, 1.0);
+    e.tick();
+    await flush();
+    const miss0 = countLog(e, "✗ 预测失败");
+    e.channel.call("player.setCurrentPlay", null, [idOf(2000)]);
+    await flush();
+    e.flushTimers();
+    eq(countLog(e, "✗ 预测失败"), miss0, "★★ 预约没有消费预载槽 → 没被误记成「押不中」");
+    eq(countLog(e, "开始预载（当前曲目）｜ track=2000"), 0, "★★ 槽还在 → 不会把 B 当「当前曲目」重复预载");
+
+    const f0 = e.fetchLog.length;
+    e.channel.call("audioplayer.load", null, [idOf(2000) + "-y", { songId: 2000, musicurl: "http://cdn.example/pk.flac" }]);
+    await flush();
+    e.flushTimers();
+    ok(!e.fetchLog.slice(f0).some((u) => /pk\.flac/.test(String(u))), "★★ 认领路径没有下载 payload 给的 URL（B 早就预载好了）");
+    ok(countLog(e, "开始预载（下一首）｜ track=3000") >= 1, "★ 认领后接着预载「下一首的下一首」3000（无缝链条不断）");
+  }
+
+  /* ---------- 74~77. v0.4.2 流式那一首也能预约 ---------- */
+
+  /**
+   * 造一个「流式在播 + 下一首已预载就绪」的环境。
+   * ★ 这是真机最常见的形态：切歌单后 110ms 就 `load`，新歌单第一首的预载根本来不及 → 只能流式。
+   *   然后它自然播完，就是用户听到的「卡一下」（实测 503ms）。
+   */
+  async function streamSeamEnv(mode) {
+    const e = createEnv();
+    delete e.win.__gpStream; // 出厂默认 → 流式
+    if (mode) e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode }));
+    e.boot();
+    await flush();
+    e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+    // ★ 要紧跟 load（真机只隔 110ms）——中间 await 的话预载会提前就绪，就变成缓冲了
+    streamLoad(e, idOf(1000) + "-x", "http://cdn.example/ss.flac");
+    await flush();
+    e.audio.last.duration = 200;
+    e.audio.emit("loadedmetadata");
+    await flush();
+    e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+    await flush();
+    await flush();
+    await flush();
+    e.flushTimers();
+    return e;
+  }
+
+  section("74. ★★★ v0.4.2 流式那一首也能预约（把实测 503ms 的卡顿干掉）");
+  {
+    const e = await streamSeamEnv("playorder");
+    ok(countLog(e, "预载就绪（下一首）｜ track=2000") >= 1, "（前提）2000 已预载就绪");
+    const n0 = e.started.length;
+    e.audio.last.currentTime = 199.0; // 距结束 1.0s
+    e.tick();
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[sched] 预约") >= 1, "★★ 流式那一首也预约了（原来这里直接 return）");
+    ok(countLog(e, "｜ 来源=流式") >= 1, "★★ 日志标明来源是流式");
+    eq(e.started.length, n0 + 1, "★★ 排上了一个 buffer source");
+    const s = lastOf(e.started);
+    eq(s.off, 0, "★ 从 0 开始");
+    ok(
+      Math.abs(Number(s.at) - 1.0) < 0.15,
+      "★★ at = ctx.now + (duration - currentTime) ≈ 1.0（实际 " + Number(s.at).toFixed(3) + "）"
+    );
+  }
+
+  section("75. ★★★ v0.4.2 流式交接：<audio> 被按住、B 直接接上、这一首改由缓冲发声");
+  {
+    const e = await streamSeamEnv("playorder");
+    e.audio.last.currentTime = 199.0;
+    e.tick();
+    await flush();
+    const bNode = nodeOf(e.started, 0);
+    e.ctx.currentTime = 1.0; // 到点（B 排在 ctx 1.0）
+    e.audio.last.currentTime = 200;
+    e.audio.emit("ended");
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "无缝交接 ｜ A=1000 → B=2000 ｜ 来源=流式") >= 1, "★★ 走「无缝交接」分支且来源是流式");
+    ok(!!e.last("End"), "★★ [end] 已发出（UI 才会推进）");
+    ok(!!bNode && e.stopped.indexOf(bNode) < 0, "★★★ 已经接上的 B 没被停掉");
+    eq(e.audio.last.paused, true, "★★ 交接时把 <audio> 按住了（否则会双声）");
+    e.tick();
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "播法=缓冲") >= 1, "★★ 交接后这一首改由缓冲发声（S.stream 置回 false）");
+  }
+
+  section("76. ★★ v0.4.2 流式的「结束时刻」估晚了 → 交接时立刻起播（不留空档）");
+  {
+    const e = await streamSeamEnv("playorder");
+    e.audio.last.currentTime = 199.0; // 推 1.0s 后结束
+    e.tick();
+    await flush();
+    const n1 = e.started.length;
+    const schedNode = nodeOf(e.started, n1 - 1);
+    // 模拟 duration 被高估：ended 在 ctx 还没走到 1.0 的时候就来了
+    e.audio.last.currentTime = 200;
+    e.audio.emit("ended");
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "结束时刻估晚了") >= 1, "★★ 识别出「估晚了」");
+    eq(e.started.length, n1 + 1, "★★ 换了一个新节点立刻起播");
+    ok(Math.abs(Number(lastOf(e.started).at) - 0.005) < 0.01, "★★ 新节点就在当前时刻起播（不等原来那个未来时刻）");
+    ok(!!schedNode && e.stopped.indexOf(schedNode) >= 0, "★ 原来那个排在将来的被停掉，不会晚点再响一遍");
+  }
+
+  section("77. ★ v0.4.2 流式的 duration 还不可用（NaN）→ 不预约（不瞎猜）");
+  {
+    const e = await streamSeamEnv("playorder");
+    e.audio.last.duration = NaN;
+    e.tick();
+    await flush();
+    e.flushTimers();
+    eq(countLog(e, "[sched] 预约"), 0, "★★ duration 无效 → 不预约");
+  }
+
+  /* ---------- 汇总 ---------- */
+  console.log("\n====================");
+  console.log("通过 " + pass + " 项，失败 " + fail + " 项");
+  if (fail) {
+    console.log("\n失败清单：");
+    failures.forEach((f) => console.log("  - " + f));
+    // ★ 用 exitCode 而不是 process.exit() —— 这样 test/mutate.js 能**在同进程内**跑我们。
+    //   原因：Windows 沙箱里 spawnSync 子进程会 EBUSY，mutate.js 以前那种「开子进程」
+    //   跑法整个是空转的（拿不到输出 → 判定恒真 → 假绿灯）。
+    process.exitCode = 1;
+    return;
+  }
+  console.log("全部通过 ✅");
+}
+
+// ★ 导出这个 promise：test/mutate.js 直接 await 它，不用开子进程。
+module.exports = main().catch((e) => {
+  console.error("验证台自己崩了：", e);
+  process.exitCode = 2;
+});

@@ -1,0 +1,622 @@
+#!/usr/bin/env node
+/*
+ * GaplessPlayer 变异测试
+ *
+ * 目的：验证「离线验证台」不是摆设。
+ *   做法：把源码里某段关键逻辑抠掉 / 改坏，再跑验证台。
+ *         如果验证台仍然全绿 → 说明那条断言是假的（没盯住这段代码）→ 报红。
+ *         如果验证台变红 → 说明断言确实在看这段代码 → 通过。
+ *
+ * 用法：node test/mutate.js
+ */
+
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+
+const ROOT = path.join(__dirname, "..");
+const SRC = path.join(ROOT, "src");
+const MUT = path.join(ROOT, ".mut");
+const HARNESS = path.join(__dirname, "harness.js");
+
+/** 每个变异：把 file 里的 find 换成 replace，然后跑验证台，要求它必须变红。 */
+const MUTATIONS = [
+  {
+    name: "main: 不挂 channel.registerCall（UI 主路径注册不到）",
+    file: "main.js",
+    find: "channel.registerCall = wr;",
+    replace: "/* MUTATED: 故意不挂钩 */ void wr;",
+    expect: "3e",
+  },
+  {
+    name: "main: 不挂 appendRegisterCall（UI 备用路径注册不到）",
+    file: "main.js",
+    find: "legacyNativeCmder.appendRegisterCall = wa;",
+    replace: "/* MUTATED: 故意不挂钩 */ void wa;",
+    expect: "3d",
+  },
+  {
+    name: "main: emit 不派发给 registeredCalls（只通知原生）",
+    file: "main.js",
+    find: "handlers[i].apply(null, args);",
+    replace: "/* MUTATED: 不派发 */ void handlers[i];",
+    expect: "3c",
+  },
+  {
+    name: "startup: 不包 channel.registerCall",
+    file: "startup_script.js",
+    find: "channel.registerCall = w;",
+    replace: "/* MUTATED: 不包 */ void w;",
+    expect: "15",
+  },
+  {
+    name: "startup: 不包 appendRegisterCall",
+    file: "startup_script.js",
+    find: "legacyNativeCmder.appendRegisterCall = w;",
+    replace: "/* MUTATED: 不包 */ void w;",
+    expect: "15",
+  },
+  {
+    name: "startup: 不建 window.registeredCalls",
+    file: "startup_script.js",
+    find: "var reg = (window.registeredCalls = window.registeredCalls || {});",
+    replace: "var reg = {};",
+    expect: "15",
+  },
+  {
+    name: "A1: 不旁听播放列表（playlist 永远空 → 算不出下一首）",
+    file: "main.js",
+    find: "S.playlist = songs;",
+    replace: "/* MUTATED: 不记列表 */ void songs;",
+    expect: "17",
+  },
+  {
+    name: "A1: nextTrack 取成当前曲目（不预载下一首）",
+    file: "main.js",
+    find: "return list[k + 1];",
+    replace: "return list[k];",
+    expect: "17",
+  },
+  {
+    name: "A1: 去掉预载命中分支（切歌总是重新下载）",
+    file: "main.js",
+    find: "var pre = takePreload(trackId);",
+    replace: "var pre = null; void takePreload;",
+    expect: "17",
+  },
+  {
+    name: "A1: takePreload 不校验 trackId（乱命中别人的 buffer）",
+    file: "main.js",
+    find: 'if (!p || p.trackId !== trackId || p.status !== "ready") return null;',
+    replace: "if (!p) return null;",
+    expect: "19",
+  },
+  {
+    name: "A1: 不解析 JSON 字符串列表（真机踩过的坑）",
+    file: "main.js",
+    find: "songs = JSON.parse(songs);",
+    replace: "/* MUTATED: 不解析，字符串当数组用 */ void songs;",
+    expect: "23",
+  },
+  {
+    name: "A1.5: 规则①失效（当前曲目没就绪也不预载它自己）",
+    file: "main.js",
+    find: "if (S.loadedTrackId !== cur) {",
+    replace: "if (false) {",
+    expect: "16",
+  },
+  {
+    name: "A1.5: 开机不预载（bootFromMemory 不触发）",
+    file: "main.js",
+    find: "bootFromMemory();",
+    replace: "void bootFromMemory;",
+    expect: "24",
+  },
+  {
+    name: "A1.5: 开机记忆不写文件（退回不可靠的 localStorage）",
+    file: "main.js",
+    find: 'betterncm.fs.writeFile(MEM_FILE, new Blob([payload], { type: "application/json" }));',
+    replace: "void MEM_FILE;",
+    expect: "24",
+  },
+  {
+    name: "A1.5: 不认过期的开机记忆（>24h 也照猜）",
+    file: "main.js",
+    find: "if (o.t && age > 24 * 3600 * 1000) {",
+    replace: "if (false) {",
+    expect: "24",
+  },
+  {
+    name: "A1.5: setCurrentPlay 不记记忆（只靠 load 记，选中即播的场景会漏）",
+    file: "main.js",
+    find: '          saveLastTrack(tid, "选中");',
+    replace: "          void tid;",
+    expect: "24",
+  },
+  {
+    name: "A1.5: 改名漏改调用点（addListElement 分支调 maybePreloadNext）",
+    file: "main.js",
+    find: "          maybePreload();\n        } else {",
+    replace: "          maybePreloadNext();\n        } else {",
+    expect: "26",
+  },
+  {
+    name: "A1.5: 切歌单不作废过期预载（白下上一份歌单的歌）",
+    file: "main.js",
+    find: "if (S.preload && !keep && S.preload.trackId !== S.curTrackId) {",
+    replace: "if (false) {",
+    expect: "28",
+  },
+  {
+    name: "A1.5: 记忆日志不写来源（分不清「选中」还是「加载」）",
+    file: "main.js",
+    find: 'saveLastTrack(trackId, "加载");',
+    replace: "saveLastTrack(trackId);",
+    expect: "29",
+  },
+  {
+    name: "版本号与 manifest 不一致（忘 bump / 装错包）",
+    file: "main.js",
+    find: 'var VERSION = "1.0.0";',
+    replace: 'var VERSION = "0.2.1";',
+    expect: "27",
+  },
+
+  /* ---- v0.2.9 只记歌不记进度 ---- */
+  {
+    name: "v0.2.9: 记忆 payload 里塞回 pos（说好的只记歌呢）",
+    file: "main.js",
+    find: "JSON.stringify({ id: trackId, t: Date.now() })",
+    replace: "JSON.stringify({ id: trackId, pos: 0, t: Date.now() })",
+    expect: "30",
+  },
+
+  /* ---- v0.2.5 掐断在飞下载 ---- */
+  {
+    name: "v0.2.5: 作废不掐断在飞下载（退回「只丢结果」）",
+    file: "main.js",
+    find: "        p.abort.abort();",
+    replace: "        void p.abort;",
+    expect: "37",
+  },
+  {
+    name: "v0.2.5: 换预载目标时不掐断上一个",
+    file: "main.js",
+    find: "        old.abort.abort();",
+    replace: "        void old.abort;",
+    expect: "37",
+  },
+  {
+    name: "v0.2.5: fetchBytes 不把 signal 传给 fetch",
+    file: "main.js",
+    find: "fetch(url, signal ? { signal: signal } : undefined)",
+    replace: "fetch(url)",
+    expect: "37",
+  },
+
+  /* ---- v0.2.6 开机保护窗口 ---- */
+  {
+    name: "v0.2.6: 保护窗口默认就开着（没记忆也开 → 第一首不预载了）",
+    file: "main.js",
+    find: "    bootWindow: false,",
+    replace: "    bootWindow: true,",
+    expect: "24",
+  },
+  {
+    name: "v0.2.6: 读到记忆也不开保护窗口（网易云的恢复照旧冲掉记忆）",
+    file: "main.js",
+    find: "        S.bootWindow = true;",
+    replace: "        S.bootWindow = false;",
+    expect: "25",
+  },
+  {
+    name: "v0.2.6: setCurrentPlay 无视保护窗口（开机恢复照样冲记忆、抢预载）",
+    file: "main.js",
+    find: "          if (S.bootWindow && (S.bootRestoreTrackId === null || tid === S.bootRestoreTrackId)) {",
+    replace: "          if (false) {",
+    expect: "25",
+  },
+
+  /* ---- v0.2.7 保护窗口补完 ---- */
+  {
+    name: "v0.2.7: 开机读记忆的竞态守卫失效（读到刚写进去的值 → 误开窗口）",
+    file: "main.js",
+    find: "        if (S.wroteMemory) {",
+    replace: "        if (false) {",
+    expect: "29",
+  },
+  {
+    name: "v0.2.7: 窗口内的 load 照样写记忆（网易云恢复流程被当用户行为）",
+    file: "main.js",
+    find: '    if (S.bootWindow) {\n      log("[mem] 窗口内收到 load',
+    replace: '    if (false) {\n      log("[mem] 窗口内收到 load',
+    expect: "25",
+  },
+  {
+    name: "v0.2.7: 窗口内仍然更新 curTrackId（预载被网易云恢复那首抢走）",
+    file: "main.js",
+    find: "            //    maybePreload() 会拿它去预载，把「记忆那首」的下载掐断（真机踩过 97MB）。\n            return false;",
+    replace: "            //    maybePreload() 会拿它去预载，把「记忆那首」的下载掐断（真机踩过 97MB）。\n            S.curTrackId = tid;\n            return false;",
+    expect: "25",
+  },
+  {
+    name: "v0.2.7: 用户切到别的歌也不关窗（窗口永远吞掉记账）",
+    file: "main.js",
+    find: "          if (S.bootWindow) {\n            // 用户主动切到**别的**歌 → 关窗，恢复正常记账",
+    replace: "          if (false) {\n            // 用户主动切到**别的**歌 → 关窗，恢复正常记账",
+    expect: "25",
+  },
+  {
+    name: "v0.2.7: 窗口内连续播放 ≥10s 也不关窗",
+    file: "main.js",
+    find: "        performance.now() - S.bootPlayStart >= 10000",
+    replace: "        performance.now() - S.bootPlayStart >= 99999999",
+    expect: "38",
+  },
+
+  /* ---- v0.2.8 日志瘦身 ---- */
+  {
+    name: "v0.2.8: 日志开关失效（噪音照样全写）",
+    file: "main.js",
+    find: "    if (!on) return;",
+    replace: "    if (false) return;",
+    expect: "9b",
+  },
+  {
+    name: "v0.2.8: [call] ▶ 正则又放宽（player.* 的 UI 设置类全刷进来）",
+    file: "main.js",
+    find: "if (/^audioplayer\\.|^player\\.(setCurrentPlay|addListElement)$/.test(n)) {",
+    replace: "if (/player|audio|play|pause|seek|vol/i.test(n)) {",
+    expect: "9b",
+  },
+
+  /* ---- v0.2.10 随机播放下自适应停止「预载下一首」 ---- */
+  {
+    name: "v0.2.10: 不结算「预测押没押中」（永远发现不了随机播放）",
+    file: "main.js",
+    find: 'if (!p || p.why !== "下一首") return;',
+    replace: "if (true) return;",
+    expect: "40",
+  },
+  {
+    name: "v0.2.10: slot 不记 why（「预载当前曲目」被当成预测 → 误计数）",
+    file: "main.js",
+    find: 'var slot = { trackId: trackId, why: why || "?", status: "pending"',
+    replace: 'var slot = { trackId: trackId, why: "下一首", status: "pending"',
+    expect: "41",
+  },
+  {
+    name: "v0.2.10: 判定随机播放后照样预载下一首（白下流量没省掉）",
+    file: "main.js",
+    find: "    if (S.preloadNextOff) return;",
+    replace: "    if (false) return;",
+    expect: "40",
+  },
+  {
+    name: "v0.2.10: 押不中阈值形同虚设（99 次才关）",
+    file: "main.js",
+    find: "var PRELOAD_MISS_LIMIT = 3;",
+    replace: "var PRELOAD_MISS_LIMIT = 99;",
+    expect: "40",
+  },
+  {
+    name: "v0.2.10: 结算时机错（notePrediction 被挪到 maybePreload 之后 / 删掉 → 永远算不出押没押中）",
+    file: "main.js",
+    find: "          notePrediction(tid);\n          // ★ v0.4.1：无缝预约的三种情形",
+    replace: "          // ★ v0.4.1：无缝预约的三种情形",
+    expect: "40",
+  },
+  {
+    name: "v0.2.10: 免费恢复失效（相邻再多也不重新开启）",
+    file: "main.js",
+    find: "    if (S.preloadNextOff && S.seqStreak >= 2) {",
+    replace: "    if (S.preloadNextOff && S.seqStreak >= 99999) {",
+    expect: "42",
+  },
+  {
+    name: "v0.2.10: 「顺序播放」信号不去重（同一首被算两次，信号错乱）",
+    file: "main.js",
+    find: "    if (tid === S.lastOrderTrackId) return; // 同一首会重复发 setCurrentPlay，不算新的一首",
+    replace: "    // （去重被删掉）",
+    expect: "42",
+  },
+  {
+    name: "v0.2.10: [list] 日志又用回旧 curTrackId（索引/下一首 是上一首的，误导排查）",
+    file: "main.js",
+    find: '          var nx = nextTrack(tid);\n          log("[list] 当前曲目 track=" + tid + " ｜ 索引=" + playlistIndex(tid) + " ｜ 下一首="',
+    replace: '          var nx = nextTrack();\n          log("[list] 当前曲目 track=" + tid + " ｜ 索引=" + playlistIndex() + " ｜ 下一首="',
+    expect: "43",
+  },
+
+  /* ---- v0.4.0 流式播放（<audio>） ---- */
+  {
+    name: "v0.4.0: 不挂 loadedmetadata（onLoad 永远发不出去 → UI 一直转圈）",
+    file: "main.js",
+    find: '    el.addEventListener("loadedmetadata", onMeta);',
+    replace: "    // 忘了挂 loadedmetadata",
+    expect: "52",
+  },
+  {
+    name: "v0.4.0: metadata 之前就发 onLoad（duration=0，UI 拿不到时长）",
+    file: "main.js",
+    find: "    if (!apply(url)) return false;\n    return true;\n  }",
+    replace: '    if (!apply(url)) return false;\n    emitLoad(0, ""); // 变异：提前发\n    return true;\n  }',
+    expect: "52",
+  },
+  {
+    name: "v0.4.0: loadProgress 改发 0（回归真机踩过的「UI 转圈 + 暂停失灵」）",
+    file: "main.js",
+    find: 'emit("audioplayer.onPlayProgress", S.audioId[0], pos, 1);',
+    replace: 'emit("audioplayer.onPlayProgress", S.audioId[0], pos, 0);',
+    expect: "56",
+  },
+  {
+    name: "v0.4.0: 换歌不摘旧事件（旧歌的事件会串到新歌上）",
+    file: "main.js",
+    find: "    if (detachStream) {\n      try {\n        detachStream();\n      } catch (e) {}\n      detachStream = null;\n    }",
+    replace: "    // 变异：忘了摘旧事件",
+    expect: "55",
+  },
+  {
+    name: "v0.4.0: 手势重试走 doPlay（会被乐观置的 paused 挡住 → 永远重试不成功）",
+    file: "main.js",
+    find: "      S.pendingPlay = false;\n      // ★ 直接调 startPlayback（**绕过** doPlay 的「已经在播就忽略」守卫）：\n      //   被拒之后 `S.paused` 可能被一次失败的乐观置位搞成 false，走 doPlay 会直接被忽略掉。\n      startPlayback();",
+    replace: "      S.pendingPlay = false;\n      doPlay();",
+    expect: "54",
+  },
+  {
+    name: "v0.4.0: 不忽略「迟到的 play() 拒绝」（状态被翻回去、手势监听重新挂上）",
+    file: "main.js",
+    find: '    if (gen !== undefined && gen !== S.playGen) {\n      log("[play] 旧的一次 play() 拒绝被忽略（已经有更新的尝试）");\n      return;\n    }\n',
+    replace: "",
+    expect: "54",
+  },
+  {
+    name: "v0.4.0: 本地文件不走 mountFile（本地歌直接播不了）",
+    file: "main.js",
+    find: "    if (local) {\n      // 本地文件：`betterncm.fs.mountFile` 给一个可播 URL（LFP 就是这么做的）",
+    replace: "    if (false) {\n      // 本地文件：`betterncm.fs.mountFile` 给一个可播 URL（LFP 就是这么做的）",
+    expect: "57",
+  },
+  {
+    name: "v0.4.0: 每次 load 都 createMediaElementSource（第二次必抛 InvalidStateError）",
+    file: "main.js",
+    find: "    if (S.el) return S.el;\n    if (!S.ctx) return null;",
+    replace: "    if (!S.ctx) return null;",
+    expect: "58",
+  },
+  {
+    name: "v0.4.0: 静音自检失效（被跨域静音了也不告警、不退回缓冲）",
+    file: "main.js",
+    find: "      if (S.silentTick >= 2 && !S.silentSuspect) {",
+    replace: "      if (false) {",
+    expect: "59",
+  },
+
+  /* ---- v0.4.1 真无缝预约 ---- */
+  {
+    name: "v0.4.1: ★★ 交接时 stopSource 挪到「提升 B」之后（把正在响的 B 停掉）",
+    file: "main.js",
+    find: "      playClockStop(); // 把 A 最后一段折进 playedMs\n      stopSource(); // ★ 此刻 S.source 仍是 A（流式时是元素）→ 只停 A，绝不碰 B\n      S.stream = false; // ★ v0.4.2：从这一刻起由 B 的缓冲发声\n      S.source = sc.src;",
+    replace: "      playClockStop();\n      S.stream = false;\n      S.source = sc.src;\n      stopSource(); // 变异：挪到提升 B 之后 → 会把正在响的 B 停掉",
+    expect: "63",
+  },
+  {
+    name: "v0.4.1: ★★ 预约时就把 S.source 改成 B（A 的 onended 守卫失败 → [end] 永不发）",
+    file: "main.js",
+    find: "    // ★ 刻意**不动 `S.source`**：A 的 `onended` 守卫是 `src === S.source`，\n    //   一旦改成 B，A 播完时守卫失败 → `onNaturalEnd` 不触发 → 不发 `[end]` → UI 永不推进。\n    S.sched = {",
+    replace: "    S.source = src; // 变异：预约时就把当前 source 改成 B\n    S.sched = {",
+    expect: "63",
+  },
+  {
+    name: "v0.4.1: 删掉 loadSong 顶部的「无缝认领」短路（到了 load 又重播一遍）",
+    file: "main.js",
+    find: "    if (S.sched && S.sched.phase === \"live\" && S.sched.trackId === trackId) {\n      claimSeamless(id, payload, trackId);\n      return;\n    }",
+    replace: "    // 变异：删掉认领短路",
+    expect: "64",
+  },
+  {
+    name: "v0.4.1: 删掉 doPlay 的 announce 分支（认领后 UI 停在「暂停」）",
+    file: "main.js",
+    find: "      if (S.sched && S.sched.phase === \"claimed\" && !S.sched.announced) {\n        S.sched.announced = true;\n        log(\"[play] ★ 无缝认领 → 补发 onPlayState(1)（不重启）\");\n        emitPlayState(1);\n        S.sched = null;\n        return;\n      }",
+    replace: "      // 变异：删掉 announce 分支",
+    expect: "65",
+  },
+  {
+    name: "v0.4.1: 时间窗失效（还剩 5 分钟也敢排）",
+    file: "main.js",
+    find: "    if (left < 0.3 || left > 1.5) return;",
+    replace: "    if (false) return; // 变异：时间窗失效",
+    expect: "62",
+  },
+  {
+    name: "v0.4.1: 模式闸门失效（随机 / 单曲循环也照样预约）",
+    file: "main.js",
+    find: "    var mode = readPlayMode();\n    if (mode !== null) {\n      if (mode !== \"playonce\" && mode !== \"playorder\") return;\n    } else if (S.seqStreak < 2) {\n      return;\n    }",
+    replace: "    var mode = readPlayMode(); // 变异：模式闸门失效",
+    expect: "62",
+  },
+  {
+    name: "v0.4.1: 播放模式键名又写错（用 PLAYER 而不是 NM_SETTING_PLAYER）",
+    file: "main.js",
+    find: 'raw = localStorage.getItem("NM_SETTING_PLAYER");',
+    replace: 'raw = localStorage.getItem("PLAYER");',
+    expect: "61",
+  },
+  {
+    name: "v0.4.1: 暂停不撤销预约（B 会到点自己响）",
+    file: "main.js",
+    find: '    if (S.sched) cancelSched("暂停"); // ★ v0.4.1：暂停必须撤销预约（否则 B 会到点自己响）',
+    replace: "    // 变异：暂停不撤销预约",
+    expect: "67",
+  },
+  {
+    name: "v0.4.1: cancelSched 不停已排上的 source（B 会到点自己响）",
+    file: "main.js",
+    find: '    if (sc.phase === "armed") {\n      try {\n        sc.src.onended = null;\n      } catch (e) {}\n      try {\n        sc.src.stop();\n      } catch (e) {}',
+    replace: '    if (false) {\n      try {\n        sc.src.onended = null;\n      } catch (e) {}\n      try {\n        sc.src.stop();\n      } catch (e) {}',
+    expect: "67",
+  },
+  {
+    name: "v0.4.1: 押错不 abortSeamless（错歌一直响下去）",
+    file: "main.js",
+    find: '            } else {\n              // 押错：预约的是别的 → 撤销（live 时还要停掉已经响起来的 B）\n              abortSeamless("押错（预约 " + S.sched.trackId + "，实际 " + tid + "）");\n            }',
+    replace: "            } else {\n              // 变异：押错不处理\n            }",
+    expect: "66",
+  },
+  {
+    name: "v0.4.1: 用 takePreload 代替 peekPreloadBuffer（消费掉预载槽 → 自适应瞎 + 重复预载）",
+    file: "main.js",
+    find: "    var buf = peekPreloadBuffer(nid);",
+    replace: "    var buf = takePreload(nid);",
+    expect: "73",
+  },
+  {
+    name: "v0.4.1: live 窗口不抑制进度（进度条从 0 闪一下）",
+    file: "main.js",
+    find: "      if (S.sched && S.sched.phase === \"live\") return;",
+    replace: "      if (false) return; // 变异：live 不抑制进度",
+    expect: "72",
+  },
+  {
+    name: "v0.4.1: 无缝交接分支整个失效（永远等 UI 的 load → ~195ms 间隙）",
+    file: "main.js",
+    find: "    if (sc && sc.phase === \"armed\") {",
+    replace: "    if (false) { // 变异：不走无缝交接",
+    expect: "63",
+  },
+
+  /* ---- v0.4.2 流式那一首也能预约 ---- */
+  {
+    name: "v0.4.2: 流式不参与预约（回到「流式播完必卡 503ms」）",
+    file: "main.js",
+    find: "    if (S.stream) {\n      if (!S.el) return;\n    } else if (!S.buffer || !S.source) {\n      return;\n    }",
+    replace: "    if (S.stream) return; // 变异：流式不预约\n    if (!S.buffer || !S.source) return;",
+    expect: "74",
+  },
+  {
+    name: "v0.4.2: 交接时忘了把 S.stream 置回 false（<audio> 停住了但还在读它的位置）",
+    file: "main.js",
+    find: "      S.stream = false; // ★ v0.4.2：从这一刻起由 B 的缓冲发声\n",
+    replace: "",
+    expect: "75",
+  },
+  {
+    name: "v0.4.2: 去掉「结束时刻估晚了 → 立刻起播」的兜底（VBR 的 duration 一偏就留空档）",
+    file: "main.js",
+    find: "      if (sc.startCtxTime > S.ctx.currentTime + 0.03) {",
+    replace: "      if (false) { // 变异：估晚了也不管",
+    expect: "76",
+  },
+];
+
+
+/**
+ * 在**同一个进程里**跑验证台。
+ *
+ * ⚠️ 为什么不用 spawnSync 开子进程：Windows 沙箱里 spawn 子进程会直接 EBUSY
+ *    （连 cmd.exe 都起不来），拿不到任何输出。而旧版判定写的是 `r.code !== 0` ——
+ *    spawn 失败时 status 是 null，`null !== 0` 恒真 → **不管验证台红不红都算「抓住」**。
+ *    也就是说变异测试整个是空转的假绿灯（2026-10-14 发现）。
+ *    同进程跑还有个好处：快得多（不用每轮重开一次 node）。
+ */
+async function runHarness(srcFile, startupFile) {
+  const out = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  const origSrc = process.env.GP_SRC;
+  const origStartup = process.env.GP_STARTUP;
+
+  process.env.GP_SRC = srcFile;
+  process.env.GP_STARTUP = startupFile;
+  process.exitCode = 0;
+  console.log = (...a) => out.push(a.map(String).join(" "));
+  console.error = (...a) => out.push(a.map(String).join(" "));
+
+  let code = 0;
+  try {
+    delete require.cache[require.resolve(HARNESS)];
+    await require(HARNESS); // harness.js 导出的是它的 main() promise
+    code = process.exitCode || 0;
+  } catch (e) {
+    out.push("验证台自己崩了：" + (e && e.stack ? e.stack : e));
+    code = 2;
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+    if (origSrc === undefined) delete process.env.GP_SRC;
+    else process.env.GP_SRC = origSrc;
+    if (origStartup === undefined) delete process.env.GP_STARTUP;
+    else process.env.GP_STARTUP = origStartup;
+  }
+  return { code, out: out.join("\n") };
+}
+
+/** 从验证台输出里挑出「有 ✗ 的段落号」—— 段落头按顺序打印，✗ 前面最近的段落头就是它所属段落 */
+function failedSections(out) {
+  const secs = new Set();
+  let cur = null;
+  out.split("\n").forEach((line) => {
+    const m = /^──\s*(\d+)\./.exec(line);
+    if (m) cur = m[1];
+    if (line.indexOf("✗") >= 0 && cur) secs.add(cur);
+  });
+  return Array.from(secs);
+}
+
+async function main() {
+  fs.mkdirSync(MUT, { recursive: true });
+  let caught = 0;
+  const missed = [];
+
+  for (const m of MUTATIONS) {
+    const orig = fs.readFileSync(path.join(SRC, m.file), "utf8");
+    if (orig.indexOf(m.find) < 0) {
+      console.log("  ?? 锚点没命中：" + m.name + "  （" + m.file + " 里找不到 " + JSON.stringify(m.find) + "）");
+      missed.push(m.name + " [锚点失配]");
+      continue;
+    }
+    const mutated = orig.split(m.find).join(m.replace);
+    const out = path.join(MUT, m.file.replace(/\.js$/, "") + ".mut.js");
+    fs.writeFileSync(out, mutated);
+
+    const src = m.file === "main.js" ? out : path.join(SRC, "main.js");
+    const startup = m.file === "startup_script.js" ? out : path.join(SRC, "startup_script.js");
+    const r = await runHarness(src, startup);
+
+    // ★ 先确认验证台**真的跑起来了**（有输出、且不是自己崩了）。
+    //   不确认这一步的话，就会重演「spawn 失败 → 判定恒真 → 假绿灯」。
+    const ran = r.out.length > 0 && r.out.indexOf("验证台自己崩了") < 0;
+    const failed = r.code !== 0;
+    const hitSection = r.out.indexOf(m.expect) >= 0 && r.out.indexOf("✗") >= 0;
+
+    if (!ran) {
+      missed.push(m.name + " [验证台没跑起来]");
+      console.log("  ?? 验证台没跑起来：" + m.name + "  ｜ 退出码=" + r.code);
+    } else if (failed && hitSection) {
+      caught++;
+      console.log("  ✓ 抓住了：" + m.name);
+    } else if (failed) {
+      caught++;
+      console.log("  ✓ 抓住了（但没落在预期段落 " + m.expect + "，实际红了第 " + failedSections(r.out).join("/") + " 段）：" + m.name);
+    } else {
+      missed.push(m.name);
+      console.log("  ✗ 漏网了（验证台仍然全绿）：" + m.name);
+    }
+  }
+
+  console.log("\n====================");
+  console.log("变异点 " + MUTATIONS.length + " 个，抓住 " + caught + " 个，漏网 " + missed.length + " 个");
+  if (missed.length) {
+    console.log("\n漏网清单：");
+    missed.forEach((n) => console.log("  - " + n));
+    process.exit(1);
+  }
+  console.log("全部变异都被抓住 ✅");
+}
+
+main().catch((e) => {
+  console.error("变异测试自己崩了：", e);
+  process.exit(2);
+});

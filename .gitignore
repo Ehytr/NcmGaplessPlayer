@@ -1,0 +1,19 @@
+# 打包产物（用 GitHub Releases 分发，不入库）
+dist/
+
+# 变异测试的临时产物
+.mut/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

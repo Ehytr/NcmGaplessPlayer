@@ -1,0 +1,1448 @@
+# GaplessPlayer 开发日志（0.1.0 → 1.0.0）
+
+> 面向使用者的安装与使用说明见 [README](../README.md)。
+
+---
+
+## ★ v0.4.2 —— 流式那一首也能预约（真机：卡 503ms → 几毫秒）
+
+### 用户反馈
+
+> 「手动点下一首可以做到无缝播放下一首即点即放，但是自然播完到下一首还是会卡一下」
+
+### 真机日志里的完整证据链（v0.4.1，用户切歌单后听的第一首）
+
+```
+19:26:53.721  player.addListElement（换歌单）
+19:26:53.734  setCurrentPlay        ← +13ms
+19:26:53.736  开始预载（当前曲目）    ← 预载刚开始
+19:26:53.846  audioplayer.load      ← 只隔 110ms → 预载根本来不及 → 走流式
+19:27:04.304  [end] ★ 自然播完      ← 流式那首播完
+19:27:04.752  [load]                ← +448ms（等 UI）
+19:27:04.807  [play] source.start   ← **+503ms**
+```
+
+两层原因：
+
+1. **v0.4.1 里流式那一首完全不参与预约** —— `maybeScheduleSeamless` 开头就是 `if (S.stream) return`。
+   所以下一首**明明已经预载 ready**（日志里 `预载=3355459547/ready`），也用不上。
+2. **为什么它会是流式**：切歌单后 13ms 就 `setCurrentPlay`、110ms 就 `load` ——
+   新歌单第一首的预载根本来不及。所以「切歌单后的第一首」天然是流式。
+
+### 解法：流式也预约，结束时刻用 `duration - currentTime` 推
+
+```js
+left = el.duration - el.currentTime;
+endCtxTime = ctx.currentTime + left;
+src.start(endCtxTime, 0);
+```
+
+**为什么够准**：Chrome 的 `HTMLMediaElement.currentTime` 是**按 `last_time_update` 插值**算出来的
+（不是 250ms 一跳），误差只有几毫秒；而我们要排的只是 **1.5s 以内**的未来时刻，
+媒体时钟与 AudioContext 的漂移也可以忽略。
+
+**唯一不确定的是 `duration` 本身**（VBR / 流式 metadata 可能是估算值）→ 交接时还有一道兜底：
+
+> 如果 `ended` 已经来了、而 B 还排在将来 **>30ms**，就换一个新节点「现在起播」。
+> **宁可早 5ms，也不留一个空档。**
+
+### ★ 交接时多一步：`S.stream = false`
+
+顺序是命门：
+
+```
+playClockStop()
+stopSource()        ← ★ 必须在这里（S.stream 还是 true → 才会把 <audio> 按住）
+S.stream = false    ← ★ v0.4.2：从这一刻起由 B 的缓冲发声
+S.source = sc.src   ← 提升 B
+emitEnd()
+playClockStart()
+```
+
+- `stopSource()` 放太晚 → `<audio>` 还在播 → **双声**
+- `S.stream` 忘了置回 false → `position()` 还在读已经停住的元素 → **进度条卡住**
+
+### 核验
+
+- 验证台 **291 项断言 / 70 个场景**（新增 74~77：流式预约 / 流式交接 / 估晚兜底 / duration 无效不猜）
+- 变异 **67 个，全部抓住**（新增 3 个：流式不预约 / 忘置 `S.stream` / 去掉估晚兜底）
+- 包 == src（4 个文件逐文件 MD5）
+
+### 仍然存在的一处代价
+
+**冷启动第一首**（开机后第一首、或切到新歌单的第一首）还是流式 —— 那时没有预载可用。
+但它**之后**的每一首都会接上缓冲链，所以只有「第一首 → 第二首」这一次过渡会走流式预约（现在也是几毫秒了）。
+
+## ★ v0.4.1 —— 真无缝预约：把切歌间隙从 ~134ms 干到 0
+
+### 起因：v0.4.0 已经「快」了，但不「无缝」
+
+v0.4.0 真机验证通过（切歌 3.5s → ~0.5s），但量了一下**自然播完 → 下一首起播**的间隔：
+
+```
+14:38:53.637 [end] → 14:38:53.755 [play] source.start = 118 ms
+14:42:08.659 → 14:42:08.803 = 144 ms
+14:44:43.922 → 14:44:44.076 = 154 ms
+14:49:07.156 → 14:49:07.287 = 131 ms
+14:53:30.679 → 14:53:30.799 = 120 ms
+16:00:03.988 → 16:00:04.126 = 138 ms
+                                  平均 ≈ 134 ms
+```
+
+**这 134ms 不是下载造成的，是「等网易云 UI」**：`[end]` → +21ms `setCurrentPlay` → +121ms `audioplayer.load`
+→ 再等 UI 发 `play`。预载命中省掉的是前面那 3.5s，但**起播时机仍然捏在 UI 手里**。
+
+### ★★ 为什么只有缓冲路径能无缝
+
+| | 怎么让下一首开始 | 什么时候真的出声 |
+|---|---|---|
+| 缓冲（Web Audio） | `B.start(T)`，T 是**正在播 A 的那个时钟**上的时刻 | 音频线程在**第 T 个采样**精确执行 → **0 间隙** |
+| 流式（`<audio>`） | 只有 `B.play()` | `ended` + JS 事件循环 + 管线唤醒 ≈ 几十~几百 ms，**不可控也无法补偿** |
+
+`<audio>` **没有**「指定起播采样点」的能力 → 全流式永远到不了 0。
+（顺带：网易云原生播放器也不是真无缝 —— 它用 `AutoTrackChangeFadeIn/Out` 淡入淡出把间隙掩盖掉。）
+
+### 做法：不等 UI，自己排
+
+上一首还剩 **0.3~1.5s** 时（100ms tick 命中），自己建一个 `AudioBufferSourceNode`，
+`src.start(上一首的结束采样, 0)` 排上去。UI 的 `load` 迟到 ~120ms 到达时，按 trackId **认领**（不重启）。
+
+**三段状态机**（`S.sched.phase`）：
+
+| 阶段 | 含义 | `S.source` | 关键动作 |
+|---|---|---|---|
+| `armed` | 已排上，A 还在播 | **仍是 A** | 什么都不做（★ 改了就发不出 `[end]`） |
+| `live` | A 已播完、**B 已在响**、UI 还没 load（~120ms 窗口） | B | 抑制进度；等 load |
+| `claimed` | UI 的 load 到了、已认领 | B | 等首个 play → 补发 `onPlayState(1)` |
+
+**★★ 命门（两件事必须同时满足）**：
+
+1. **预约阶段绝不能动 `S.source`** —— A 的 `onended` 守卫是 `src === S.source`，
+   一旦改成 B，A 播完时守卫失败 → `onNaturalEnd` 不触发 → **不发 `[end]` → UI 永不推进**。
+2. **交接时 `stopSource()` 必须在「提升 B」之前** —— 此刻 `S.source` 还是 A，只停 A；
+   反过来写（先提升 B 再 stopSource）就会**把正在响的 B 停掉**。
+
+验证台有**结构性变异 M1/M2** 专门守这两条。
+
+### 三重闸门（全过才排）
+
+1. **缓冲路径 + 在播**（流式那首拿不到精确结束时刻 → 不排）
+2. **预载槽里正是「列表里的下一首」且 ready**（用 `peekPreloadBuffer` **只读不消费** ——
+   用 `takePreload` 会清槽 + `preloadToken++`，导致① 押中率统计瞎了、② 对 B 重复预载）
+3. **置信「顺序播放」**：`localStorage["NM_SETTING_PLAYER"].mode ∈ {playonce, playorder}`
+   —— **能读到就一票定音**（⚠️ 单曲循环下 `seqStreak` 会冻结在高位，不能只信它）；
+   读不到才退回 `seqStreak >= 2`
+4. `S.sched === null`（没排过）+ 时间窗 [0.3, 1.5]s
+
+### 撤销（六处挂载点）
+
+`暂停` / `拖动` / `切歌`（setCurrentPlay 押错 → `abortSeamless`）/ `切歌单`（addListElement）/
+`audioplayer.stop`（UI 切歌单时会发，**仍照旧放行给原生**）/ `startSource`（保险）。
+
+- `armed` → `src.stop()`（start 在未来，stop 即取消，**不出声**）
+- `live`/`claimed` → 只清标记（调用方自己决定要不要停声音）
+- **押错** → `abortSeamless`：停掉已响的 B + 复位到「未就绪」，交回正常加载
+  （真机时序：`setCurrentPlay` 比 `load` 早 ~120ms → **错歌只响 ~21ms**）
+
+### 逃生开关
+
+`window.__gpSeamless = false` → 完全不预约（退回 v0.4.0 行为，一行控制台即可）。
+
+### 已知代价
+
+**流式播的那一首 → 下一首仍是 ~195ms**（`<audio>` 拿不到精确结束时刻，无法预约）。
+只发生在「链条断开处」（随机模式、开机第一首、押错时）；一旦接上缓冲链，后续每首都无缝。
+
+### 核验
+
+- 验证台 **275 项断言 / 66 个场景**（新增 61~73：闸门五种情形 / 交接不打断 B / 认领不重启 /
+  三次 play / 押错收尾 / 四类撤销 / playedMs 归属 / live 抑制进度 / peek 不破坏语义）
+- 变异 **64 个，全部抓住**（新增 12 个，含 M1/M2 两个**结构性变异**）
+- 包 == src（4 个文件逐文件 MD5）
+
+## ★ v0.4.0 —— 两条播放路径：能预载就缓冲（可无缝），不能就流式（快）
+
+### 需求与最终结论
+
+> 用户先问「能做流式播放吗」→「如果能做流式播放就不用分播放模式」→ 又追问
+> 「全流式可以做到无缝衔接吗」「不能在当前这首快结束时开始预载下一首然后直接接上吗」
+
+**答案是：全流式做不到无缝，所以做成两条路径。** 而且这不是推测 —— 这个项目的文件头第 8 行
+早就写着原因：
+
+> `<audio>` 一次只能播一个源、且**无法采样级调度**，所以做不到真无缝
+
+「接上」那一步的区别只有一个词：**能不能指定「在哪个采样点开始出声」**。
+
+| | 怎么让下一首开始 | 什么时候真的出声 |
+|---|---|---|
+| **缓冲（Web Audio）** | `B.start(T)` —— T 是**正在播 A 的那个时钟**上的时刻 | 音频线程在**第 T 个采样**精确执行 → **0 间隙** |
+| **流式（`<audio>`）** | 只有 `B.play()` | `ended` 事件延迟 + JS 事件循环 + 媒体管线唤醒 ≈ **几十~几百 ms**，不可控也无法补偿 |
+
+**「预载下一首然后直接接上」这个思路是对的 —— 但「接上」只有缓冲路径能做。**
+所以预载必须留着，流式用来解决「没有预载可用时」的等待。两者互补，不是二选一。
+
+### 实测：现在的版本**不是无缝**，还有 ~195ms
+
+v0.2.10 真机日志，7 次自然播完（全部预载命中）：
+
+```
+[end] 播完 → [play] source.start  间隔 = 150 / 161 / 244 / 159 / 185 / 200 / 262 ms
+                                      平均 ≈ 195 ms
+```
+
+而且这 195ms **不是下载造成的**，是**等网易云 UI**：
+`[end]` → +39ms `setCurrentPlay` → +120ms `audioplayer.load` → 再等 UI 的 `play`。
+
+代码侧确认：`startSource(offset, when)` 的 `when` 参数**一直是 0**，
+**没有任何**「提前预约下一首」的代码 —— 文件头第 29 行写着「`start(when)` 留到 A1.5」。
+→ **要真无缝，必须补上「预约」**（v0.4.1，见下）。
+
+### 两条路径怎么分工（**按每首歌决定，不需要读播放模式**）
+
+| 场景 | 走哪条 | 切歌表现 |
+|---|---|---|
+| 顺序播放 / 列表循环（预载押中） | 缓冲 | 0 等待（v0.4.1 起 + 预约无缝） |
+| 随机 / 单曲循环 / 心动模式（押不中 → 自适应关预载） | 流式 | ~0.5s，**本来也不需要无缝** |
+| 顺序播放但没押中 / 没来得及 | 流式 | ~0.5s（比原来的 3.5s 好得多） |
+| **流式播的那一首 → 下一首** | 只能等 UI | ~195ms（`<audio>` 没有精确结束时刻，预约不了） |
+
+★ 一旦进入「缓冲」的链条就会一直缓冲下去（每首都在播的时候把下一首预载好了）；
+流式只出现在**链条断开处**（随机模式、开机第一首、押错时）。
+
+### 流式路径的实现（照 LFP 的配方）
+
+```js
+S.el = new Audio();                              // ★ 不设 crossOrigin —— 照 LFP
+S.el.preload = "auto";
+S.el.volume = 1;                                 // 音量统一由 S.gain 控
+S.mediaSrc = S.ctx.createMediaElementSource(S.el);
+S.mediaSrc.connect(S.gain);                      // mediaSrc → gain → analyser → destination
+```
+
+- ★ **只建一个元素、只调一次 `createMediaElementSource`** —— 它对同一元素**只能调一次**
+  （第二次抛 `InvalidStateError`）。切歌只换 `src`。
+- ★ **`gain / analyser / destination` 完全没动** → **FFT / 可视化照常有效**。
+- ★ **不设 `crossOrigin`**：跨域音频一旦被 taint，`MediaElementSource` 会输出**纯静音**；
+  LFP 就是这么干的、而且它在真机上是**有声音**的 → 本机不存在这个问题。
+  仍然加了**廉价自检**（见下）兜底。
+- ★ **`onLoad` 必须等 `loadedmetadata`**（那时才有 `duration`），另加 **8s 超时兜底**
+  （否则弱网时 UI 会一直转圈）。
+- ★ **`loadProgress` 固定发 1**：真机踩过「发 0 → UI 一直转圈 + 暂停失灵」。
+- ★ **换歌先摘旧事件**（`attachStreamEvents` 每次重新挂、换歌先 `detachStream()`）：
+  元素的 `loadedmetadata`/`ended`/`error` **不告诉你**是哪一次 load 的，靠闭包捕获 token 判断过期。
+- ★ **本地文件走 `betterncm.fs.mountFile(path)`** 拿 blob URL（LFP 的做法）。
+- ★ **autoplay policy**：`el.play()` 返回 promise，被拒（`NotAllowedError`）时
+  排队等**一次性手势监听**（`pointerdown`/`keydown`）命中再起播。两个坑：
+  ① `doPlay()` 是**乐观**置 `S.paused = false` 的，而拒绝是**异步**的 →
+  「手势重试」必须**绕过** `doPlay` 的「已经在播就忽略」守卫，直接调 `startPlayback()`；
+  ② 迟到的拒绝会把手势监听重新挂上 → 用 `playGen` 代号忽略过期的那次。
+- ★ **静音自检**（每 1s，几乎零成本）：`流式 + 在播 + currentTime 在涨 + 连续 ~2s FFT 全 0`
+  → 判「疑似被跨域静音」→ 后续曲目自动退回缓冲路径。
+  ⚠️ 已经进了 Web Audio 的元素**摘不出来**，所以自愈只能「下一首生效」。
+
+### 逃生开关（控制台，改了立刻生效）
+
+| 开关 | 作用 |
+|---|---|
+| `window.__gpStream = false` | 强制走缓冲（退回 v0.3.0 的播法） |
+| `window.__gpNativeAll = true` | `audioplayer.*` 整条放行给网易云原生播放器 |
+| `window.__gpLogVerbose = true` | 日志全量 |
+
+### 顺带删掉：v0.3.0 的「按播放模式分流」
+
+那套（非顺序模式交回原生）**已删**，因为：
+
+- **键名写错了**：真身是 `NM_SETTING_PLAYER`，不是 `PLAYER`。
+  当初在 leveldb 里搜到 `PLAYER` 就以为是键名 —— 那其实是 `NM_SETTING_PLAYER` 的**尾巴**
+  （leveldb 的键是**前缀压缩**的，共享的 `NM_SETTING_` 被压掉了）→ **分流从未生效过**。
+- 用户要的是「所有模式都由插件播」，只是**播法**不同。
+
+只留了一个**手动逃生开关** `window.__gpNativeAll`（不是按模式分流）。
+
+### 已知限制（如实写）
+
+- **流式播的那一首没有无缝**（`<audio>` 拿不到精确结束时刻）→ 只有 ~195ms（等 UI）。
+- 切歌从「预载命中 0 等待」变成「未命中 ~0.5s」—— 但**换来的是**：不再有 3.5s 的整首下载 + 解码，
+  内存也不再持有 70~90MB 的解码缓冲。
+- **`start(when)` 预约（真无缝）留到 v0.4.1**，见下。
+
+### 验证
+
+- 验证台 **229/229**（新增 51~60：走流式 / onLoad 等 metadata / 超时兜底 / play 被拒与手势重试 /
+  换歌摘旧事件 / loadProgress=1 / 本地 mountFile / createMediaElementSource 只调一次 /
+  静音自检 / 出厂默认）
+- 变异 **51/51 干净抓住**（新增 9 个，含「手势重试走 doPlay」「不忽略迟到的拒绝」这种
+  **从真机日志里挖出来的结构性 bug**）
+
+## ★ v0.3.0 —— 按播放模式分流：只有「顺序播放 / 列表循环」才由插件播
+
+### 需求
+
+> 「只有顺序播放或列表循环才使用当前插件播放，其他时候使用网易云原来的方法播放」
+
+### 为什么这么分
+
+插件播的代价是**必须先把整首歌下完再解码**（`decodeAudioData` 要求完整文件），
+真机实测切歌平均等 **3.5s**；换来的是「下一首可预测 → 预载秒开」。
+
+而**随机模式下这个收益根本没有**（v0.2.10 实测 16 次预载 **0 命中**、白下 **1076 MB**）
+→ 白等 3.5 秒。网易云原生的 C++ 播放器是**流式**的
+（`audio_source_cache.cpp` + `audio_stream.cpp`，边下边解），切歌几乎立刻出声。
+
+所以：**能预测下一首的模式**（顺序播放 / 列表循环）用插件；**不能预测的**（随机 / 单曲循环 / 心动模式）交回原生。
+
+### ★ 播放模式怎么读：`localStorage` 的 `NM_SETTING_PLAYER`
+
+> ⚠️ **更正（v0.4.0）**：这里原本写的是 `PLAYER`，**是错的**。真身是 `NM_SETTING_PLAYER` ——
+> leveldb 的键**前缀压缩**，当初搜到的 `PLAYER` 其实是这个长键的**尾巴**。详见 v0.4.0 章节。
+
+翻遍了 `channel.call` 的**全部命令**和 UI 注册的**全部事件**，**没有任何播放模式信号**：
+
+| 看着像的 | 实际是 |
+|---|---|
+| `player.setLineMode` | **歌词行模式**（和 `setLRCColor` / `setFont` / `setOffset` 一组） |
+| `player.updateTooltips` | **迷你播放器**的提示文字 |
+| `play_mode` | 只出现在**埋点日志**里（`core.js` 的 `R.play_mode`） |
+
+真正的位置在 `localStorage` —— 网易云自己就是这么存的（`core.js` 的 `dc.setting.hS()`）：
+
+```
+NM_SETTING_PLAYER → {"volume":0.229…,"autoplay":false,"mode":"playorder","speed":1,"mode2":…,"ntc":3,"time":…}
+```
+
+`core.js` 里的模式表（`s.order`）：
+
+| 值 | 名字 | 图标 | 菜单 id | 谁播 |
+|---|---|---|---|---|
+| `playonce` | **顺序播放** | `icn_order` | 1043 | **插件** |
+| `playorder` | **列表循环** | `icn_loop` | 1040 | **插件** |
+| `playcycle` | 单曲循环 | `icn_repeat` | 1041 | 原生 |
+| `playrandom` | 随机播放 | `icn_shuffle` | 1042 | 原生 |
+| `playai` | 心动模式 | `icn_ai` | 1044 | 原生 |
+
+⚠️ 还要复刻 `hS()` 的一个分支：**`mode3 && mode2` 时实际生效的是 `playai`**（名义模式被覆盖）。
+
+**为什么直接读 localStorage 就够**：网易云切模式时就是 `localStorage.setItem("NM_SETTING_PLAYER", …)`
+（`AE` → `O9` → `localStorage.setItem`），**同步、即时** → 每次要用的时候现读即可，**不需要事件**。
+
+### ★ 怎么把播放交回去：`handle()` 返回 false
+
+`installInterceptor` 里，`handle()` 返回 false 就走 `below.apply(...)` → 原生。
+
+**原生确实实现了这几条命令** —— `cloudmusic.dll` 里 `audioplayer` 的方法表是：
+
+```
+enmeratorDevices / stop / setVolume / seek / play / load
+```
+
+`audioplayer.cpp` 里还能看到 `DoLoad` 读的正是 UI 传来的那几个字段
+（`musicurl` / `dfsId` / `songId` / `fileSize` / `bitrate`），以及
+`plugin::Player::SetSrc`、`'loading'/'buffering'/'playing'/'ended'/'paused'/'stopped'`、
+`audio_visualizer_process.cpp`（`audioplayer.onAudioData`）、
+`AutoTrackChangeFadeIn/Out`（自动切歌淡入淡出）。
+`pause` 则是 LFP 和本插件**启动时就在用**的（「把原生播放器按住」，否则会和 Web Audio 叠成双声道）。
+
+### 三个必须处理的细节
+
+1. **放行前先停掉我们自己的 source** —— 否则两边同时出声（双声道）。
+2. **从原生切回插件时通知原生 `audioplayer.stop`** —— 否则它还在放上一首。
+3. **放行模式下不预载**（`maybePreload()` 直接 return）—— 原生在播，预载纯属白下。
+
+### 三个控制台开关（不用出包，改了立刻生效）
+
+| 开关 | 作用 |
+|---|---|
+| `window.__gpModeRoute = false` | 关掉分流，退回 v0.2.10（全部由插件播） |
+| `window.__gpForceNative = true` | 强制走原生（排查用） |
+| `window.__gpForcePlugin = true` | 强制走插件（排查用） |
+
+⚠️ 模式**读不到**时保守选「插件播」（插件一定能播）。
+
+### 真机旁证
+
+装 v0.3.0 之前的那个会话（v0.2.10，15:26 起）日志里 `[list]` 的索引是
+`0,1,2,3,4,5,6,7,8` **顺序递增**，且 `命中！跳过下载` 有 **9 次** ——
+说明当时是列表循环模式、预载正在正常工作。而 leveldb 里那一份就是
+`"mode":"playorder"` —— 完全对得上。
+
+### 验证
+
+- 验证台 **214/214**（新增 44~50：两种模式由插件播 / 三种放行 / 保守与开关 / 放行不预载 / 切回时停原生）
+- 变异 **50/50 干净抓住**（新增 8 个）
+- 顺带把验证台**加固**了：`last()` 返回 null 时直接 `.args[0]` 会把验证台**搞崩**（退出码 2），
+  那样变异体是「崩了」而不是「干净报红」。加了 `argAt()` / `at()` / `lastOf()` 三个安全取值函数。
+
+## ★ v0.2.10 —— 随机播放下不再白下「下一首」（自适应）
+
+### 起因：用户问「预载下一首对随机播放是不是无效？」
+
+拿 45 分钟真机日志（v0.2.9，`gapless-player.log` 22:27~23:12，900 行）实测 —— **是「无效」，而且是零命中**：
+
+| 指标 | 数值 |
+|---|---|
+| `预载（下一首）` 次数 | 16 |
+| `★★ 命中！跳过下载` | **0** |
+| `预载就绪（下一首）`（真下完了） | 14 |
+| **白下流量** | **1076 MB**（平均 76.9 MB/首） |
+| 切歌实际等待 | **平均 3482 ms**（一点没省到） |
+
+最硬的证据：只看**自然播完 → 自动续播**（排除「用户手动乱点」），13 次**全部没中**：
+
+```
+预载了 493275349   → 实际自动播到 460043667   ❌
+预载了 518895654   → 实际自动播到 1931280236   ❌
+预载了 1990743306  → 实际自动播到 25706282     ❌   …（13 次全一样）
+```
+
+### 根因
+
+`nextTrack()` = `playlist[playlistIndex() + 1]`，**只在顺序播放成立**。
+随机模式下下一首由网易云客户端自己挑，与 `player.addListElement` 给的列表顺序无关 ——
+真机里当前曲目的索引是 `857 / 595 / 628 / 179 / 900 / 331 / 865 / 514 / 62 …`，完全随机。
+
+### ★ 决定可行性的发现：网易云切歌前**不预告**下一首
+
+逐个曲目核对「它的 id 在日志里**首次**出现的时刻」= `player.setCurrentPlay` 那一刻，
+距 `audioplayer.load` 只有 **~80ms**。
+
+→ 「在随机模式下预载得**更准**」**做不到**；唯一出路是「**别预载**」。
+
+### 改法：自适应（不需要知道网易云的随机状态）
+
+1. **结算押中率**：`setCurrentPlay` 时看预载槽里那首是不是要播的（`notePrediction`）。
+   ⚠️ 必须赶在 `maybePreload()` **之前** —— 它会 `startPreload(当前曲目)` 把预测槽换掉，
+   换掉之后就再也看不出押没押中。
+2. **连续 3 次押不中** → `preloadNextOff = true`，不再预载下一首。
+   **保留「预载当前曲目」**（那条是知道要播才下的，有用）。
+3. **重新打开只靠免费信号**（`notePlayOrder`）：连续 2 首在列表里**索引相邻**。
+   随机播放下这个概率 ≈ 1/列表长度（真机 900 首）→ 基本只可能是顺序播放，
+   **不用再白下一首去试探**。
+4. 只有 `why === "下一首"` 才算「预测」——「预载当前曲目」是我们**已经知道**要播的。
+
+### 为什么砍掉是**零代价**的
+
+随机模式下预载从未命中 → 切歌等待时间不会变差（本来就是 3.5s），
+纯粹省下 **1 GB / 45 分钟** 的流量，外加白解码的 70~90 MB 内存。
+
+### 顺带修的日志 bug
+
+`[list] 当前曲目 track=X ｜ 索引=… ｜ 下一首=…` 里的索引/下一首原来是**上一首的** ——
+v0.2.7 把 `S.curTrackId = tid` 挪到了这行日志**之后**，而 `playlistIndex()` / `nextTrack()`
+读的正是 `S.curTrackId`。排查时会被误导。现在两者都接受可选 `id`，日志里显式传 `tid`。
+
+### 验证
+
+- 验证台 **188/188**（新增 40 随机播放关闭 / 41 why 判定 / 42 免费恢复 / 43 日志 bug）
+- 变异 **42/42 干净抓住**（新增 8 个，含「结算时机错」这种结构性变异）
+
+## ★ v0.2.9 —— 主动下线「位置记忆」：只记歌，不记进度
+
+### 决定
+
+> 「回退到 0.2.4，之后不需要做记忆时间的功能」
+
+**记忆回到 v0.2.4 的形态：payload 只有 `{ id, t }`（哪首歌 + 写入时刻），不再记播放位置。**
+
+### 删掉了什么
+
+| 删掉 | 原来是什么 |
+|---|---|
+| payload 里的 `pos` | v0.2.5 加的位置字段 |
+| 开机续播 | `resumePos` / `resumeTrackId` + `onBufferReady` 里那段（含边界判断） |
+| 暂停 / 拖动 / 播放中周期 的位置落盘 | v0.2.5 加的三处 |
+| 「同一首沿用旧 pos」规则 | `lastSaved`（那是为了保住 pos 才有的） |
+
+### ★ 但**没有**回退到「v0.2.4 的行为」，这一点很重要
+
+严格回退到 v0.2.4 会把一个坑带回来：**网易云开机那串恢复会冲掉记忆** ——
+`setCurrentPlay` 带的是**它自己恢复的歌**，v0.2.4 照记，于是文件变成「固定一首歌」。
+这个坑从 v0.2.3 就有，v0.2.7 才修掉。
+
+所以这一版**保留了跟「位置」无关的全部修复**：
+
+| 保留 | 它修的是什么坑 |
+|---|---|
+| **开机保护窗口**（v0.2.6/0.2.7） | 网易云整串恢复（`setCurrentPlay → load → seek`）不许写记忆 —— **没有它，记歌也不稳** |
+| **AbortController**（v0.2.5） | 作废预载时真掐断在飞下载（不再白下 97MB） |
+| **日志瘦身**（v0.2.8） | 只写排查用得上的，噪音挂 `LOG_VERBOSE` |
+| **开机读取竞态守卫**（v0.2.7） | 异步读记忆时若已写过，忽略这次读取 |
+
+结果：**只记歌，而且记歌真的稳。**
+
+### 兼容
+
+老记忆文件里还带着 `pos` 字段 → **直接忽略**，不报错、也不续播。
+
+### 验证
+
+- 验证台 **166/166**（删掉 6 个位置相关场景；测试 30 改成「payload 只有 id/t + 老记忆的 pos 被忽略」；
+  测试 39 改成「点自己那首 → 关窗 + 命中预载」）。
+- 变异 **34/34 全部干净抓住**（删掉 9 个引用已删代码的僵尸变异，新增 1 个
+  「payload 里塞回 pos」；修 1 个锚点）。
+- 出包 `GaplessPlayer-0.2.9.plugin`（解压后逐文件 MD5 == src，VERSION == manifest == 0.2.9）。
+
+### 待真机验证
+
+1. 重启后 `cat C:\betterncm\gapless-player.lasttrack.json` → 应该只有 `{"id":…,"t":…}`（**没有 pos**）。
+2. 记忆仍不被网易云的恢复冲掉：`[mem] 开机保护窗口已开` +
+   `[mem] ★ 开机恢复（网易云自己挑的…）→ 窗口保持…`，文件里的歌不变。
+3. 点自己那首 → `[preload] ★★ 命中！跳过下载 + 解码`（秒开）；起播位置是 **0**（不续播，符合预期）。
+
+## ★ v0.2.8 —— 日志瘦身：只写排查用得上的（砍掉 57%）
+
+### 起因
+
+> 「修改 log 文字生成部分，改成只写入当前需要的」
+
+真机一次开机 **256 行**，其中 **147 行（57%）是噪音**，把要看的淹了：
+
+| 类别 | 行数 | 说明 |
+|---|---|---|
+| `[call] 首次出现命令：xxx` | 86 | 开机把网易云所有命令名刷一遍 |
+| `[call] ▶ player.*`（UI 设置类） | 33 | `setInfo` / `setCover` / `setMiniPlayerInfo`… 跟播放无关 |
+| `[intro]` 注册表逐条 dump | 28 | 每次启动重复 3 遍 × 10 行 |
+
+→ 改完预计 **256 → 109 行**。
+
+### 改法：一个开关 + 收窄一个正则
+
+```js
+var LOG_VERBOSE = false;   // 默认只写用得上的
+
+function logVerbose() {    // 噪音走这里
+  var on = LOG_VERBOSE;
+  if (!on) { try { on = !!window.__gpLogVerbose; } catch (e) { on = false; } }
+  if (!on) return;
+  log.apply(null, arguments);
+}
+```
+
+- **默认写**：`banner` / `[env]` / `[ctx]` / `[fft]` / `[guard]` / `[boot]`、
+  `[mem]` / `[resume]` / `[preload]` / `[fetch]`、
+  `[list]` / `[cmd]` / `[load]` / `[play]` / `[pause]` / `[seek]` / `[emit]` / `[prog]` / `[hb]` / `[vol]`
+- **默认不写**（走 `logVerbose`）：上面那三类。
+- `[call] ▶` 的正则从 `/player|audio|play|pause|seek|vol/i` **收窄**成
+  `/^audioplayer\.|^player\.(setCurrentPlay|addListElement)$/` —— 只留跟播放/预载真正相关的。
+- `[intro]` 两行摘要**合成一行**（原来 3 次启动 × 2 行）。
+
+### 想看全量怎么办
+
+- **不用重新出包**：控制台里 `window.__gpLogVerbose = true`，立刻开始写全量。
+- 或者把 `LOG_VERBOSE` 改 `true` 重新打包。
+
+### 验证
+
+- 验证台 **182/182**（测试 9b 重写成「默认不写噪音 + 开 verbose 照常写」）。
+- 变异 **43/43 全部干净抓住**（新增 2 个：开关失效 / 正则又放宽）。
+- 出包 `GaplessPlayer-0.2.8.plugin`（解压后逐文件 MD5 == src，VERSION == manifest == 0.2.8）。
+
+## ★ v0.2.7 —— 保护窗口「补完」：网易云的自动恢复播放也拦下来
+
+### 真机反馈（v0.2.6 之后）
+
+> 「gapless-player.lasttrack.json 在播放时与关闭后写的都没有问题，但在重新启动后会自己修改回固定歌曲的固定时间」
+
+### v0.2.6 只挡住了一半
+
+当时 16:40 那一轮的日志备份（v0.2.6-bug）（16:40 那次）：
+
+```
+43.032 [mem] ★ 开机恢复（网易云自己挑的）｜ track=20944203 → 记忆与预载槽都不动   ← 记忆挡住了 ✅
+43.082 [preload] 开始预载（当前曲目）｜ track=20944203                          ← 预载还是被抢了 ❌
+43.084 [preload] 已掐断（作废/换槽）｜ track=1441581262
+54.845 [call] ▶ player.setCurrentPlay ｜ args=[20944203_1_3136952023]  ← 还是「恢复」，不是用户
+54.994 [call] ▶ audioplayer.load ｜ args=[20944203_...]              ← 网易云在自动播它那首
+54.994 [mem] 第一次真正加载 → 开机保护窗口关闭                        ← 窗口关太早 ❌
+54.995 [mem] 记住当前曲目 ｜ track=20944203 ｜ pos=0.0s ｜ 来源=加载   ← 记忆被写回网易云那首
+54.996 [call] ▶ audioplayer.seek ｜ args=[…, 180.61999999999998]     ← 连它自己的进度也恢复了
+54.997 [mem] 记住当前曲目 ｜ track=20944203 ｜ pos=180.6s ｜ 来源=拖动
+```
+
+**关键认知**：网易云的开机恢复是**一整串** —— `setCurrentPlay` → `load` → `seek`，
+不是单独一个 `setCurrentPlay`。v0.2.6 拿 `audioplayer.load` 当「用户真的开始听了」的判据，
+**而这个 load 恰恰也是恢复流程的一部分**。
+
+### 三处漏洞，一起补
+
+1. **`player.addListElement` 分支也会调 `maybePreload()`** —— 它拿到的是 `S.curTrackId`
+   （已被恢复那首污染）→ 把「记忆那首」的预载掐断。
+   → 窗口内**不再更新 `S.curTrackId`**（恢复的那首不算「当前曲目」），这一路自然就断了。
+2. **窗口的关闭条件改了**：不再看 `load`，改成
+   **用户切到别的歌**（≠ 恢复那首）或 **实际播放累计 ≥ 10s**
+   （恢复那串是毫秒级的，能连续播 10 秒只可能是人在听）。
+3. **窗口内 `loadSong` / `doPause` / `doSeek` 都不写记忆** —— `load` 和 `seek` 都是恢复流程的一部分。
+
+### 顺带逮到一个真 bug：开机读记忆的「竞态」
+
+`bootFromMemory()` 读文件是**异步**的。如果读返回之前插件已经写过记忆
+（真机上 fs 慢的时候同样会发生），这次「开机读取」读到的就是**刚写进去的值** →
+误判成「有开机记忆」→ **误开保护窗口** → 后面的正常记账全被吞掉。
+
+```
+[mem] 记住当前曲目 ｜ track=1000 ｜ 来源=选中 ｜ 已写文件     ← 先写了文件
+[mem] 读到开机记忆（来自文件）｜ track=1000                  ← 异步读才回来，读到的是刚写的
+[mem] 开机保护窗口已开                                      ← 误开
+```
+
+→ 加了守卫：`if (S.lastSaved) { 忽略这次读取 }`。
+
+### 修完之后的行为
+
+| 场景 | 结果 |
+|---|---|
+| 重启，网易云只恢复、不播 | 记忆完全不动 ✅ |
+| 重启，网易云自动播它那首 | 记忆不动（≤10s 内你切走的话）✅ |
+| 重启，网易云自动播它那首，你听了 ≥10s | 判定你在听它 → 关窗记账 ✅ |
+| 重启后点**自己那首** | 关窗 → **位置保住**（同一首沿用旧 pos）→ 命中预载 + 续播 ✅ |
+
+### 验证
+
+- 验证台 **178/178**（测试 25 扩写「恢复是一整串」；新增 38「≥10s 关窗」、39「点自己那首」）。
+- 变异 **41/41 全部干净抓住**（新增 8 个 v0.2.7 变异；删掉 2 个僵尸条目、修 2 个锚点）。
+- 出包 `GaplessPlayer-0.2.7.plugin`（解压后逐文件 MD5 == src，VERSION == manifest == 0.2.7）。
+
+### 待真机验证
+
+1. **只恢复不播**：重启后 `cat C:\betterncm\gapless-player.lasttrack.json` 应**还是重启前那首**。
+2. **自动播了也拦得住**：应看到 `[mem] 窗口内收到 load …→ 不写记忆` +
+   `[mem] 窗口内 seek → 不写记忆`，记忆不变。
+3. **点自己那首**：`[mem] 用户切到别的歌（track=… ≠ 开机恢复 …）→ 开机保护窗口关闭` +
+   `[preload] ★★ 命中！` + `[resume] ★ 开机续播 ｜ 从 …s 起`。
+4. **真听了 ≥10s**：`[mem] 窗口内已连续播放 ≥10s → 判定用户真的在听这首 → 开机保护窗口关闭并记账`。
+
+## ★ v0.2.6 —— 开机保护窗口：网易云的「恢复」不再冲掉记忆
+
+### 真机反馈
+
+> 「在网易云运行时，gapless-player.lasttrack.json 里的歌曲、时间写的内容都是对的，关闭网易云后内容依旧正确，
+> 但在重新启动后 gapless-player.lasttrack.json 的内容会改成固定另外一首歌中固定的一个时间」
+
+### 日志（v0.2.5-bug 备份，全程 **0 个** `audioplayer.load`）
+
+```
+39.669 [mem] 读到开机记忆（来自文件）｜ track=2758269319 ｜ pos=121.2s   ← 文件是对的
+39.669 [preload] 开始预载（开机记忆）｜ track=2758269319                 ← 正确那首开始下
+41.453 [call] ▶ player.setCurrentPlay ｜ args=[1981999919_1_3136952023]  ← 网易云自己恢复的
+41.455 [mem] 记住当前曲目 ｜ track=1981999919 ｜ pos=0.0s ｜ 来源=选中   ← 把正确记忆冲掉了
+41.457 [preload] 已掐断（作废/换槽）｜ track=2758269319                  ← 正确那首的下载被掐断
+43.645 [preload] ★★ 预载就绪 ｜ track=1981999919 ｜ 96.95 MB             ← 白下 97MB
+```
+
+**一次开机干了三件坏事**：记忆被冲掉、正确那首的预载被掐断、白下 97MB —— 而这次会话**根本没播放过**。
+
+### 根因：开机时的 `player.setCurrentPlay` 不是「用户选歌」
+
+它是**网易云自己恢复的那首歌**，而网易云的持久化状态跟我们的拦截**没关系**，
+所以它**不等于**用户上次听的那首。真机历次对照：
+
+| 会话 | 文件里的记忆 | 网易云开机恢复的 |
+|---|---|---|
+| v0.2.4（21:59） | `3439759764` | `2611706183` ← 不一样 |
+| v0.2.5（16:29） | `2758269319` @121.2s | `1981999919` ← 不一样 |
+
+而 v0.2.2 的设计前提是「一旦 `setCurrentPlay` 给出真曲目，预载槽会被 token 换掉」——
+**这个前提是错的**。于是形成恶性循环：网易云恢复 B → 我们记 B → 下次开机又按 B 预载 → **永远固定在同一首错歌上**。
+
+### 改法：「开机保护窗口」
+
+读到记忆后开一个窗口，**窗口在本次会话第一次 `audioplayer.load` 之前一直开着**。
+窗口内 `player.setCurrentPlay` 一律：
+
+1. **不写记忆**（只打一行 `[mem] ★ 开机恢复（网易云自己挑的，不是用户选的）…`）；
+2. **不调用 `maybePreload()`** —— 保住「记忆那首」的预载槽，别让它在开机 2 秒内被掐断。
+
+窗口关闭的时机 = **第一次真正 `audioplayer.load`**（说明真的开始播了，往后的选歌才算用户行为）。
+
+⚠️ 只有**读到了记忆**才开窗口 —— 没记忆就没什么可保护的，保持旧行为
+（否则「没记忆时开机预载第一首」这条 A1.5 规则会失效，验证台测试 24 盯着这个）。
+
+### 修完之后，用户点自己那首歌会怎样
+
+- 开机预载的是**记忆那首**（不是网易云恢复的那首）→ 用户点它 → **命中，秒开**；
+- `onBufferReady` 里 `curTrackId === resumeTrackId` → **续播位置照样生效**。
+
+也就是：网易云恢复它的，我们保住用户的那首。
+
+### 验证
+
+- 验证台 **164/164**（测试 25 重写为「保护窗口」的新意图；测试 37 的「换预载目标」改为先真加载一次再换）。
+- 变异 **35/35 全部干净抓住**（新增 4 个：窗口默认开着 / 读到记忆不开窗 / 加载后不关窗 /
+  `setCurrentPlay` 无视窗口）。
+- 出包 `GaplessPlayer-0.2.6.plugin`（解压后逐文件 MD5 == src，VERSION == manifest == 0.2.6）。
+
+### 待真机验证
+
+1. **记忆不被冲**：重启后应看到
+   `[mem] 读到开机记忆（来自文件）…` → `[mem] 开机保护窗口已开` →
+   `[mem] ★ 开机恢复（网易云自己挑的，不是用户选的）｜ track=… → 记忆与预载槽都不动`，
+   然后 `cat C:\betterncm\gapless-player.lasttrack.json` **应该还是重启前那首**。
+2. **点自己那首**：日志应出现 `[preload] ★★ 命中！跳过下载 + 解码` +
+   `[resume] ★ 开机续播 ｜ track=… ｜ 从 …s 起`。
+3. **窗口会关**：一旦真的播了，应看到 `[mem] 第一次真正加载 → 开机保护窗口关闭`，
+   之后切歌照常有 `[mem] 记住当前曲目 … 来源=选中`。
+
+## ★ v0.2.5 —— 开机续播上次位置 + 作废时真掐断下载
+
+### 真机反馈
+
+> 「目前 v0.2.4 没发现什么问题，继续更新」
+> 「记忆的歌对了，时间好像没有记忆」
+
+### 问题 ①：歌记住了，进度没记住
+
+记忆文件里只有 `{ id, t }` —— **没有「播放位置」这个字段**。
+位置只活在内存变量 `S.pausedAt` 里（`doPause` 时记下、`doPlay` 时拿它起播），**进程一关就归零**。
+真机日志（v0.2.4b 备份的前一轮）：
+
+```
+上轮 [pause] ★ 已停 ｜ 停在 82.851s
+重启 [play] source.start ｜ at=0.020 ｜ offset=0.000    ← 歌对了，进度从 0 开始
+```
+
+⚠️ 注意：这个位置**不是「网易云要的」**，是**我们自己的记忆**。
+真机日志里 `audioplayer.load` / `play` 的入参都没有位置，也没有随后的 `seek`。
+
+### 改法 ①：payload 扩成 `{ id, pos, t }`
+
+- **存位置的时机**：暂停（最强信号）、拖动进度、播放中每 ~30s 兜底一次。
+- **开机衔接**：只在「记忆那首」**第一次就绪**时把起播位置换成 `pos`，
+  并赶在 `emitProgress` 之前设好 `S.pausedAt`（否则进度条会先报 0 再跳）。
+- **边界**：`pos < 3s` 或 `pos > 时长 - 3s` → 视为不可用，老实从 0 开始。
+- **坑**：开机时 `player.setCurrentPlay` 和 `audioplayer.load` 各会记一笔记忆。
+  如果它们无脑把 `pos` 写 0，**刚读出来的位置还没用上就被抹掉** ——
+  所以 `saveLastTrack` 加了一条规则：**同一首歌沿用文件里已有的位置，换歌才归零**。
+
+### 问题 ②：「作废」其实是句空话
+
+`fetchBytes` 以前是裸 `fetch(url)`，作废只靠 `preloadToken++` 在各个 `.then` 检查点丢结果 ——
+**在飞的网络下载照跑到底**。真机日志实证（开机预载 3439759764，size=28057800）：
+
+```
+43.283 [preload] 地址来自 player/url ｜ size=28057800
+43.380 [fetch] status=200 ｜ CL=28057800
+43.814 [mem] 预载的 3439759764 不在新歌单里 → 作废（不白下）   ← 此刻已作废
+45.253 [fetch] ★ 26.76 MB ｜ 1971ms                        ← 可 26.76MB 还是下完了
+```
+
+省掉的只是「解码 + 占内存」，带宽照样白花。跨歌单启动时每次白下 ~26MB。
+
+### 改法 ②：`AbortController`
+
+- `startPreload` 建 `AbortController`，`fetchBytes(url, signal)` 带上 signal。
+- 新增 `dropPreload(why)` 统一「abort + 清槽 + token++」，**作废和换槽都走它**。
+- 换预载目标时，也先掐断上一个在飞的。
+- `AbortController` 拿不到（老 webview）→ 安静退化成旧行为，**不抛错**。
+- `AbortError` 是**预期内**的，只打一行 `[preload] 已掐断`，不算失败。
+
+### ★ 顺带修掉一个「假绿灯」：变异测试一直在空转
+
+发现 `test/mutate.js` 的判定写的是 `r.code !== 0`，而它靠 `spawnSync` 开子进程跑验证台。
+本机（Windows 沙箱）**spawn 子进程会直接 EBUSY**（连 `cmd.exe` 都起不来）→
+`status` 是 `null` → `null !== 0` **恒真** → **不管验证台红不红都报「抓住了」**。
+
+改法：`mutate.js` 改成**同进程内** `await require('harness.js')`（harness 导出它的 main() promise），
+并且**先确认验证台真的跑起来了**（有输出、且不是自己崩了）才判定。
+顺带把 `process.exit(1)` 换成 `process.exitCode = 1`（同进程跑时不能真的 exit）。
+
+### 验证
+
+- 验证台 **160/160**（新增 8 个场景：续播生效 / 边界回退 / 只认记忆那首 / 暂停落盘 /
+  拖动落盘 / 心跳落盘 / payload 结构 / 作废真掐断）。
+- 变异 **31/31 全部干净抓住**（新增 11 个：续播不生效 / 不校验曲目 / 不校验边界 /
+  同曲不沿用旧 pos / 暂停不落盘 / 拖动不落盘 / 心跳不落盘 / payload 不带 pos /
+  作废不掐断 / 换槽不掐断 / fetchBytes 不传 signal）。
+- 顺手让两处「变异体把验证台搞崩」变成**干净报红**：
+  用例里 `JSON.parse(文件)` → `memOf()` 容错；注册表下标访问前先 `|| {}`。
+- 出包 `GaplessPlayer-0.2.5.plugin`（解压后逐文件 MD5 == src，VERSION == manifest == 0.2.5）。
+
+### 待真机验证
+
+1. **续播**：播一首 → 拖到中段 → 暂停 → **重启网易云** →
+   应看到 `[mem] 读到开机记忆（来自文件）… pos=…`、`[mem] 开机续播已排队`、
+   `[resume] ★ 开机续播 ｜ track=… ｜ 从 …s 起`，且 `[play] source.start ｜ offset=…` 不是 0。
+2. **掐断**：开机记忆那首**不在**当前歌单里时，应看到
+   `[mem] 预载的 … 不在新歌单里 → 作废（已掐断下载）` + `[preload] 已掐断（作废/换槽）`。
+3. **老记忆兼容**：升级前那份记忆没有 `pos` 字段 → 应能正常读（`pos=0.0s`），不报错。
+
+## ★ v0.2.4 —— 开机记忆「切歌单就作废」+ 诊断信息补足
+
+### 真机反馈
+
+> 「播放之前的歌单则固定在之前那一首的固定时间，切换歌单后直接没有记忆，没有歌在显示在播放」
+
+### 日志（v0.2.3 备份）说明的事
+
+**这次会话里其实没有发生播放。** 整份日志只有 6 秒（21:50:28 → 21:50:34），
+没有任何 `player.setCurrentPlay`、没有 `audioplayer.load`、没有一条 `[hb]` 心跳
+（文件 mtime 停在 21:50:34，网易云进程当时也已关闭）。
+对照健康的 v0.2.1 会话（21:21:20 起，跑了 12 分钟）：`addListElement` 之后 11ms 就来
+`setCurrentPlay`，然后 `audioplayer.load` → `play` → 每 10s 一条心跳。
+所以「记忆更没更新」**从这份日志里判断不了** —— 没有播放，就没有东西可记。
+
+但日志暴露了一个**真实的设计缺陷**：
+
+```
+[mem] 读到开机记忆（来自文件）｜ track=1318288373 ｜ 写入于 10/13/2026, 9:50:20 PM
+[preload] 开始预载（开机记忆）｜ track=1318288373
+[preload] ★★ 预载就绪（开机记忆）｜ track=1318288373 ｜ 232.0s ｜ 84.95 MB
+[list] 播放列表更新 ｜ 33 首 ｜ 当前索引=-1        ← 用户切到「每日歌曲推荐」
+```
+
+**开机记忆里的 `1318288373` 根本不在这个 33 首的新歌单里** —— 插件照样把它整首下完
+（22 MB），纯浪费。这正是「切歌单后没有记忆」的来源：**记忆是上一份歌单的，跟当前歌单没关系。**
+
+### 改法
+
+1. **切歌单时校验记忆**：`player.addListElement` 到达时，检查预载槽里那首在不在新列表里；
+   不在就**作废**（清槽 + 递增 `preloadToken` 让在飞的下载自动失效），并打日志。
+2. **诊断信息补足**（这次最缺的就是「看不出记忆有没有在更新」）：
+   - `[list]` 行加 `｜ 首曲=… ｜ 预载中的 X 在本列表=是/否`
+   - `[mem]` 行加 `来源=选中 / 来源=加载`（区分是哪条路径写的）
+   - **心跳加 `｜ 记忆=… ｜ 预载=track/status`** → 每 10 秒都能看到记忆状态，一眼判断更没更新
+   - `saveLastTrack` 在 `trackId` 为空时也会打一行（不再静默 return）
+
+### 验证
+
+- 验证台 **132/132**（新增 28：切歌单作废过期预载 / 保留有效预载；29：记忆日志来源 + 心跳带记忆）
+- 变异 **20/20**（新增：切歌单不作废 / 记忆日志不写来源）
+- ★ 顺带：「版本号 == manifest」那条断言**当场抓住**了我改 main.js 忘了改 manifest —— 断言有用。
+
+### 待真机验证（这次请务必包含「播放」）
+
+1. 开机 → **播 3~4 首不同的歌**（可以在两个歌单之间切）→ 看日志里
+   `[mem] 记住当前曲目 ｜ track=… ｜ 来源=…` 是不是**每首都出现、track 在变**。
+2. 看 `[hb]` 行里的 `记忆=` 是不是跟着变。
+3. 重启 → `[mem] 读到开机记忆` 应该是**最后播的那首**。
+4. 切歌单时若看到 `[mem] 预载的 X 不在新歌单里 → 作废`，说明新逻辑生效了。
+
+---
+
+## ★ v0.2.3 —— 两处真凶：函数改名漏改调用点 + 记忆存错了地方
+
+### 真机反馈
+
+> 「这个开机记忆在我切换了几首后重启还记忆的是固定的一首的固定时间」
+
+日志（已备份 v0.2.2）里两处不对劲：
+
+```
+21:39:15.431 === GaplessPlayer v0.2.1 (A1 预载) 启动 ===        ← 装的是 0.2.2，横幅却写 0.2.1
+...
+21:39:17.138 [list] 播放列表更新 ｜ 35 首 ｜ 当前索引=-1
+21:39:17.138 [guard] ★ handle(player.addListElement) 抛错 ｜ ReferenceError: maybePreloadNext is not defined
+```
+
+### 根因 ①：函数改名漏改调用点（硬 bug）
+
+`maybePreloadNext` 在 v0.2.2 里改名成了 `maybePreload`，但 `player.addListElement`
+分支还调旧名 → **每次列表更新都抛 `ReferenceError`**。
+
+为什么之前没发现：`handle()` 外面套了 `try/catch`，抛错只留一行日志；
+而且 `S.playlist = songs;` 在抛错**之前**就赋值了 → 预载看起来还是好的 → 验证台全绿。
+（`[list] 播放列表更新 ｜ 35 首` 说明 JSON 解析是对的，坑就在后面那句调用。）
+
+### 根因 ②：记忆存在 `localStorage` 里，会被强杀进程丢掉
+
+NetEase 的 webview 里 `localStorage` 是**异步落盘**的：强制结束进程会丢掉最近的写入。
+于是记忆永远停在「第一次被 flush 出去的那个值」，**连时间戳一起冻住** ——
+正好对上「固定的一首、固定时间」。
+
+**改法**：记忆改存**文件**，`localStorage` 只作备份。
+
+```js
+var MEM_FILE = "C:////betterncm////gapless-player.lasttrack.json";
+betterncm.fs.writeFile(MEM_FILE, new Blob([JSON.stringify({ id: trackId, t: Date.now() })]));
+```
+
+- 读的时候**文件优先**，读不到再退回 `localStorage`（`readFile` 返回类型兼容 string / ArrayBuffer / Blob / File）。
+- 记忆时机也提前：`player.setCurrentPlay`（选中）就记一次，不再只等 `audioplayer.load`。
+- 每个读/写都打 `[mem]` 日志，下次一眼能看出「有没有写、写没写进去、读到的是什么」。
+
+### 顺带：版本号与 manifest 对齐
+
+上一轮 `VERSION` 停在 `0.2.1` 而 manifest 已是 `0.2.2`，日志横幅因此误导排查。
+现在加了一条验证台断言：**横幅版本必须等于 manifest 版本**。
+
+### 验证
+
+- 离线验证台 **123/123 全绿**（新增 26：**handle() 不许抛错**；27：**版本号一致**；
+  24 扩成「写文件 / 从文件读 / 退 localStorage / 过期不猜」四段）
+- 变异测试 **18/18 全被抓住**（新增 3 个：**改名漏改调用点** / 版本号不一致 / setCurrentPlay 不记记忆）
+
+### ★ 教训
+
+**`try/catch` 包住的 `handle()` 会把「函数名写错」这种硬 bug 变成一行日志。**
+所以验证台必须单独断言「日志里没有抛错」，不能只看功能断言 ——
+因为副作用（`S.playlist = songs`）往往发生在抛错之前，功能断言照样绿。
+
+### 待真机验证
+
+1. 播几首不同的歌 → 打开 `C://betterncm//gapless-player.lasttrack.json`，看 `id` 是不是**最后一首**。
+2. 重启 → 日志里应有 `[mem] 读到开机记忆（来自文件）｜ track=…`（而不是来自 localStorage）。
+3. 日志里**不应再出现** `[guard] ★ handle(...) 抛错`。
+
+---
+
+## ★ v0.2.2 —— 开机就把第一首也预下（A1.5）
+
+### 真机反馈
+
+> 「让插件开机就把第一首也预下，目前第二首起的预载切歌正常了」
+
+### 问题：第一首没有「上一首」可预载
+
+A1 的预载逻辑是「**当前歌在播** → 预载**下一首**」。开机时第一首还没有「上一首」，
+所以它必然走即时加载 → 开头仍要等几秒。A1.5 的 `start(when)` 也救不了它
+（无缝解决的是**接缝**，不是**首播等待**）。
+
+### 真机时序（决定这个方案可行）
+
+```
+21:10:02.005  插件 onLoad
+21:10:03.741  player.setCurrentPlay   (+1.74s)   ← 此刻已经知道第一首是谁
+21:10:06.842  audioplayer.load        (+4.84s)   ← 3.1 秒之后才要播
+```
+
+**中间有 3.1 秒提前量** —— 足够把「马上就要播的那首」下完 + 解码好。
+
+### 做法：预载规则改成两条
+
+```js
+function maybePreload() {
+  var cur = S.curTrackId;
+  if (cur === null) return;
+
+  // ① 当前曲目还没就绪 → 预载它自己（"开机就把第一首也预下"）
+  if (S.loadedTrackId !== cur) {
+    if (!hasPreload(cur)) startPreload(cur, "当前曲目");
+    return;
+  }
+
+  // ② 已经在播 → 预载列表里的下一首（切歌命中）
+  var nt = nextTrack();
+  ...
+}
+```
+
+- 新增 `S.loadedTrackId`：**已经解码好、正在播**的那首（和「当前选中」`curTrackId` 区分开）。
+  就是靠它区分「该预载自己」还是「该预载下一首」。
+- `player.setCurrentPlay` / `player.addListElement` / `onBufferReady` 三处统一调 `maybePreload()`。
+
+### 再加一手：开机记忆（多抢 ~1.7s）
+
+`setCurrentPlay` 要等到 +1.74s 才来。用 `localStorage` 记住**上次播放的那首**
+（`gaplessPlayer.lastTrack`，24h 内有效），开机（onLoad，0s）就先猜着下起来。
+
+- 猜错了不要紧：`setCurrentPlay` 一给出真曲目，预载槽会被 **token 机制**换掉（只是白下一份）。
+- `LibEAPIRequest` 可能比我们晚加载 → `bootPreload` 最多重试 6 次（400ms 间隔）。
+- 超过 24h 就不猜了（多半已经不是那首）。
+
+### 验证
+
+- 离线验证台 **115/115 全绿**（A1.5 新增：规则①预载当前 / 规则①命中 / 规则②命中 /
+  开机预载 / 24h 过期不猜 / **token 抢占（猜错 → 换真曲目 → 照样命中）**）
+- 变异测试 **15/15 全被抓住**（A1.5 新增 4 个：规则①失效 / 开机不预载 / 记忆不写 / 不认过期）
+
+### 待真机验证
+
+- 开机后第一首是否**秒开**（日志里应看到 `[preload] 开机记忆 ｜ 上次那首 track=…`
+  和 `[preload] ★★ 预载就绪（当前曲目）`，随后 `[load] ★★ 就绪（预载命中）`）。
+- 若第一首仍有等待：看日志里 `onLoad → setCurrentPlay` 的实际间隔，
+  以及「预载就绪」发生在 `audioplayer.load` 之前还是之后。
+
+---
+
+## ★ v0.2.1 —— A1 预载没生效的真凶：`player.addListElement` 的 payload 是**字符串**
+
+### 真机反馈（v0.2.0）
+
+> 「第一次放完第一首后下一首卡了很久，不知道是预载很久还是卡住了；手动切了几次，
+> 直接播放下一首将其预载好后回到上一首末尾切到下一首正常」
+
+日志里最刺眼的一行：
+
+```
+[list] 播放列表更新 ｜ 6659 首 ｜ 当前索引=-1
+[list] 当前曲目 track=2637406491 ｜ 索引=-1 ｜ 下一首=(无)
+```
+
+**索引永远 -1 → 预载从未启动过。** 「卡很久」是正常的即时加载（2~7s）；
+「切回来再切下一首正常」是 **HTTP 缓存**命中，不是预载。
+
+### 根因：payload 是 JSON 字符串，我当成了数组
+
+三个线索拼起来才能看出来：
+
+| 线索 | 值 |
+|---|---|
+| trace 日志 | `args=[[{"id":...`（**双括号**） |
+| 那行日志长度 | 6720 字符 |
+| 我的 handler 报的 | `播放列表更新 ｜ 6659 首` |
+
+`args[0]` 是**一个字符串**（长度正好 6659），内容是 JSON 文本 —— `JSON.parse` 之后是 **35 首歌**。
+我直接 `songs.length` → 拿到的是**字符串长度**；`S.playlist` 成了字符串 →
+`playlistIndex()` 遍历的是**一个个字符** → `"a".id` 是 undefined → 索引永远 -1。
+
+> 💡 认出它的办法：`safeArgs` 会把对象折叠成 `{...}`。日志里出现**没被折叠的长 JSON**
+> （即 `args=[[...]]` 双括号），就说明那是个**字符串**而不是对象/数组。
+
+### 修复
+
+```js
+var songs = args[0];
+if (typeof songs === "string") {
+  try { songs = JSON.parse(songs); } catch (e) { songs = null; }
+}
+if (songs && songs.length) { S.playlist = songs; maybePreloadNext(); }
+```
+
+顺带把 `safeArgs` 改成**截断超长字符串**（只留前 200 字符 + 真实长度），
+免得一条日志刷 6600 字符。
+
+### 验证
+
+- 离线验证台 **103/103 全绿**（新增 22：**字符串形态的列表也要认出来** + 数组形态兼容）
+- 变异测试 **11/11 全被抓住**（新增：不解析 JSON 字符串列表）
+- ⚠️ 顺带修了验证台自己：`e1.eapi.log[0].url` 在变异体下会**崩**（不是干净报红）→ 改成 `(e1.eapi.log[0] || {}).url`
+
+---
+
+## ★ v0.2.0 —— A1 预载：消除「每首开头等几秒」
+
+### 问题
+
+A0 通了之后，剩下的体验问题很明确：**每首歌开始播之前都要等一段**。实测（真机日志）：
+
+| 曲目 | 文件 | 下载 | 解码 | 合计 |
+|---|---|---|---|---|
+| 2637406491 | 29.24 MB | 2057ms | 209ms | **≈ 2.3s** |
+| 207497 | 35.90 MB | 2442ms | 348ms | **≈ 2.8s** |
+| 3381783034 | 35.64 MB | 6501ms | 300ms | **≈ 6.8s** |
+
+**这不是 bug，是 A0 架构的固有代价**：`decodeAudioData` 要求**完整文件**（一次性解成 PCM），
+所以「先下完、再解码」绕不开。LFP 用的是 `<audio>`（浏览器流式解码，下几百 KB 就能出声），
+但 `<audio>` 一次只能播一个源、无法采样级调度 → 做不出真无缝。
+**这个延迟和这个插件存在的理由，是同一枚硬币的两面。**
+
+### 做法：提前把下一首下完 + 解码好
+
+```
+当前歌播放中 ────────────────────────────────▶ 切歌
+        │
+        └─ 趁这整首歌的时间，把「列表里的下一首」下完 + 解码好
+                                                  │
+                                          切歌时直接命中 → 延迟 ≈ 0
+```
+
+### ★ 唯一硬骨头：地址从哪来
+
+网易云只在**切歌时**才发 `audioplayer.load`（带 `musicurl`），播放列表里也没有 URL。
+所以只能**主动查** —— 走已装的 **`LibEAPIRequest`**（网易云 API 请求库）：
+
+```js
+var lib = loadedPlugins.LibEAPIRequest;
+var domain = APP_CONF.domain;                    // window.APP_CONF 是 BetterNCM 自己在用的全局
+lib.eapiRequest(domain + "/api/song/enhance/player/url", {
+  method: "POST", type: "json",
+  data: { ids: "[" + trackId + "]", br: 999000 },
+  onload: function (res) { /* res.data[0].url */ },
+});
+// 失败再退到 /api/song/enhance/download/url（LibEAPIRequest 自己用的就是后者）
+```
+
+**数据来源**（真机日志核对过）：
+- `player.addListElement` 的 payload 就是**整个播放列表**（本次 35 首，字段含 `track_id`）。
+- `player.setCurrentPlay` 给当前曲目 id → 在列表里定位索引 → 下一首 = 索引 + 1。
+- 实测播放顺序与列表顺序一致（2637406491 idx3 → 207497 idx4 → 3381783034 idx5）。
+
+### 实现要点
+
+1. **旁听不拦截**：`player.addListElement` / `player.setCurrentPlay` 只观察（`return false`，照常放行）。
+2. **触发时机**：当前歌就绪（`onLoad`）后 + 每次切歌时，都尝试 `maybePreloadNext()`。
+3. **命中即用**：`audioplayer.load` 到达时按 `trackId` 取预载；命中就**跳过下载 + 解码**。
+4. **token 守卫**：快速切歌时旧预载自动作废（复用 `loadToken` 的思路，新增 `preloadToken`）。
+5. **只留一首**：预载槽只有一个，用完即释放；内存 = 当前 1 首 + 预载 1 首。
+6. **安静兜底**：`LibEAPIRequest` 不在 / 查不到地址 / 请求失败 → **退回即时加载，绝不影响正常播放**。
+
+### 已知边界（本版故意不做）
+
+- **只按「顺序播放」取 index+1**；随机 / 单曲循环不保证 → 退回即时加载（不命中而已，不会出错）。
+- **不做采样级无缝**：本版是「预载命中」，切歌仍有极小的调度间隙。`start(when)` 接缝留到 **A1.5**。
+- 预载会**多下一份**（下一首在真正播放时不会重复下，但如果用户跳过了它，那份就白下了）。
+
+### 验证
+
+- 离线验证台 **99/99 全绿**（新增 16~21：算出下一首 / 命中跳过下载 / 不命中即时加载 /
+  库不在不崩 / 查地址失败退回 / 列表末尾不预载）
+- 变异测试 **10/10 全被抓住**（新增 4 个 A1 变异点：不旁听列表 / nextTrack 取错 /
+  去掉命中分支 / takePreload 不校验 trackId）
+
+### 本轮测试配置
+`GaplessPlayer-0.2.0` + `LibEAPIRequest-1.6.2` 启用；`LibFrontendPlay-1.1.0` 与 `CallTrace-0.3.0` 停用。
+
+---
+
+## ★ v0.1.4 —— v0.1.3 修错了：`registeredCalls` 得**自己造**
+
+### 真机反馈（v0.1.3）
+
+> 「进度条依旧 00:00，依旧无法暂停」
+
+日志给出决定性事实：
+
+```
+20:44:12.037 [emit] ★ registeredCalls 不存在（BetterNCM 没注入？），只能走 triggerRegisterCall
+20:44:14.970 [intro] (启动+3s) registeredCalls=undefined ｜ triggerRegisterCall=function
+20:44:16.340 [intro] (收到 load) registeredCalls=undefined ｜ triggerRegisterCall=function
+20:44:19.131 [play] UI 一直没发 play（500ms）→ 兜底自动起播
+20:44:19.132 [emit] onPlayState ｜ 1 ｜ 2637406491_1_3136952023-bitrate-1999-zwdGNV   ← 无 |resume| 段
+```
+
+**v0.1.3 的假设错了。** 我以为 `registeredCalls` 是 BetterNCM 注入的全局，其实——
+
+### 真相：`registeredCalls` 是 LFP 自己造的
+
+拆开 LFP 的包（`LibFrontendPlay-1.1.0.plugin` = zip）看到：
+
+**① 包内 `startup_script.js`（844 B，BetterNCM 按约定自动加载包根同名文件）：**
+
+```js
+var f = {};
+window.registeredCalls = f;
+channel.registerCall = r(channel.registerCall, (n, o) => { f[n] ??= []; f[n].push(o); }).function;
+```
+
+**② manifest 里的 `hijacks`（直接改网易云打包产物，双保险）：**
+
+```json
+{ "type": "replace",
+  "from": "window.channel.registerCall=function",
+  "to":   "window.channel.registerCall=(...args)=>{registeredCalls[args[0]]=registeredCalls[args[0]]||[];registeredCalls[args[0]].push(args[1]);ncmHackChannelFunc(...args);},window.ncmHackChannelFunc=function" }
+```
+
+也就是说：**LFP 把 `channel.registerCall` 包了一层，凡是 UI 注册进来的处理器都记一份到 `window.registeredCalls`，然后自己调用它们。** LFP 一旦停用，就没人建这个表了 → v0.1.3 的派发扑空。
+
+### 注册键名（从 LFP 源码反推，已核对）
+
+LFP 的 `mo()` 用 `e = "audioplayer.onPlayState"` 做键，而它自己的调试代码是这么挂监听器的：
+
+```js
+channel.viewCall().map(e => {
+  let [t, r] = e.split(".");                       // "audioplayer.onPlayState" → t="audioplayer", r="onPlayState"
+  legacyNativeCmder.appendRegisterCall(r.slice(2), t, handler);   // → appendRegisterCall("PlayState","audioplayer",fn)
+});
+```
+
+→ 所以两条路径都要映射到同一个键：
+
+| 注册方式 | 键名 |
+|---|---|
+| `channel.registerCall("audioplayer.onPlayState", fn)` | `audioplayer.onPlayState` |
+| `legacyNativeCmder.appendRegisterCall("PlayState", "audioplayer", fn)` | `"audioplayer" + ".on" + "PlayState"` |
+
+### v0.1.4 的修复
+
+1. **新建 `src/startup_script.js`**：页面最早期建 `window.registeredCalls`，包 `channel.registerCall` 与 `legacyNativeCmder.appendRegisterCall`，把 UI 的处理器记进来（20ms × 750 次重试，防接口晚出现）。
+2. **manifest 加 `hijacks`**：照抄 LFP 的 `recordRegisterCall`（`id` 改成 `GaplessPlayer::recordRegisterCall`），即使 startup_script 跑晚了也能兜住。
+3. **`main.js` 加 `installRegistryHook()` 兜底**：插件 `onLoad` 时再包一层（幂等，带 `__gpWrapped` 标记），并让 `emit` 用多重 fallback 取注册表；`introspectRegistry()` 改为读 `window.registeredCalls`，日志里会打印到底建起来没有。
+
+> ⚠️ `legacyNativeCmder` / `channel.registerCall` / `triggerRegisterCall` 在 `betterncm.dll` 里**一次都不出现** → 它们是**网易云自己的全局**，且 `triggerRegisterCall` **只通知原生，不调用 UI 在 JS 侧的处理器**。所以「只调 triggerRegisterCall」是永远修不好的。
+
+### 验证
+
+- 离线验证台 **83/83 全绿**（新增 3e 主路径 `channel.registerCall`、15 `startup_script.js` 专项）
+- 变异测试 **6/6 全被抓住**（`test/mutate.js`）：不挂 `channel.registerCall` / 不挂 `appendRegisterCall` / `emit` 不派发 / startup 不包两个接口 / startup 不建表 —— 逐个都让验证台变红
+
+### ✅ 真机验证通过（2026-10-13 20:57）
+
+用户反馈：**「进度条和暂停都正常了」**。日志证据：
+
+```
+[intro] (插件 onLoad) registeredCalls=object ｜ triggerRegisterCall=function
+[intro] registeredCalls 共 90 个键                 ← v0.1.3 这里是 undefined
+[intro]   audioplayer.onLoad → 3 个处理器
+[intro]   audioplayer.onPlayState → 7 个处理器
+[intro]   audioplayer.onPlayProgress → 6 个处理器
+...
+37.199 [call] ▶ audioplayer.load ｜ args=[…-FaxSVF, {…}]
+39.490 [emit] onLoad ｜ duration=137.17 ｜ err=0
+39.491 [call] ▶ audioplayer.play ｜ args=[…, …|resume|HDWhSg]   ← ★ UI 自己发的 play（没走兜底）
+39.492 [emit] onPlayState ｜ 1 ｜ …|resume|HDWhSg
+40.625 [call] ▶ player.setTotalTime ｜ args=[137171]            ← ★ 与 LFP 基准完全一致
+43.692 [call] ▶ audioplayer.pause ｜ args=[…, …|pause|a1MVTT]    ← ★ 按暂停，UI 发了命令
+43.693 [emit] onPlayState ｜ 2 ｜ …|pause|f9X33W
+49.539 [hb] ready=true ｜ paused=true ｜ pos=4.1s / 137.2s      ← ★ 进度冻住
+```
+
+**两条附带结论：**
+
+1. **startup_script.js 是主力，main.js 兜底静默跳过。** 日志里**没有** `[reg] ✅ … 已挂钩` 那几行 →
+   说明 `installRegistryHook()` 跑的时候接口**已经被 startup_script 包过了**（`__gpWrapped` 已置位）。
+   设计意图（早挂钩 + 兜底）成立。
+2. **onLoad 晚到 2.3s 也不会让 UI 超时**（v0.1.3 遗留的「待验证疑点」到此了结）：
+   本次 `fetch 2081ms + 解码 209ms = 2291ms`（vs LFP 502ms），UI 照样 1ms 后就发了 play。
+   → A0「整首下完再解码」的代价目前可接受；将来做 A1 无缝时再用 `start(when)` 削掉。
+
+### 本轮测试配置
+`GaplessPlayer-0.1.4` 单独启用；`LibFrontendPlay-1.1.0` 与 `CallTrace-0.3.0` 停用。网易云版本 **2.10.13**（hijack 键 `>= 2.10.0` 匹配）。
+
+---
+
+## ★ v0.1.3 —— 「暂停失灵」的总根因找到了：**事件派发少了一步**
+
+### 基准对比（用 CallTrace 挂钩事件层测出来的）
+
+| | LFP（正常） | GaplessPlayer v0.1.1（坏） |
+|---|---|---|
+| `load` → `onLoad` | **502ms** | **3433ms** |
+| UI 收到 onLoad 后 | **发 `audioplayer.play`** | **什么都不发** |
+| UI 调 `player.setTotalTime` | **有**（137171ms） | **没有** |
+| `onPlayState` 第 2 参数 | `id\|resume\|token` | `id`（缺状态段） |
+| 按暂停时 UI 发的命令 | **`audioplayer.pause`** | **一条都不发** |
+
+→ 网易云 UI 收到 GaplessPlayer 的事件后**压根没往下走**：不点播放、不算总时长、不进「播放中」。
+「暂停按钮不干活」只是并发症。
+
+### 根因：`emit` 少了 `registeredCalls` 这一步
+
+LFP 的 `mo()` 干两件事，**少一件 UI 就没反应**：
+
+```js
+function mo(e, ...t) {
+  registeredCalls[e].map(n => n(...t));                     // ★ 派发给 UI 的 JS 处理器
+  let [r, o] = e.split(".");
+  legacyNativeCmder.triggerRegisterCall(o.slice(2), r, ...t); // 通知原生
+}
+```
+
+`registeredCalls` 是 **BetterNCM 注入的全局注册表**（在 LFP 里只出现这一次，无声明）。
+
+> ⚠️ **上面这句在 v0.1.4 已被真机推翻**：`registeredCalls` 不是 BetterNCM 注入的，而是 **LFP 自己在 `startup_script.js` + manifest `hijacks` 里建的**。LFP 停用后它就没人建了 → 见文首 v0.1.4 章节。
+
+v0.1.2 的 `emit` 只做了第二句 → **UI 的处理器压根没被调用**。
+
+### 附带修复：不再「解码完就抢跑起播」
+
+LFP 下 UI 会**先**发 `audioplayer.play`（带 token `id|resume|xxx`），`onPlayState` 用的就是这个 token。
+GaplessPlayer 抢在 UI 之前起播 → 拿不到 token → `onPlayState` 第 2 参数缺状态段。
+
+现在改成：**解码完只发 onLoad / onPlayProgress，等 UI 的 play 命令；500ms 没等到再兜底自动起播。**
+
+### 验证
+
+- 离线验证台 **64/64 全绿**（新增：等 UI 的 play、兜底起播、`registeredCalls` 派发三项）
+- 变异测试确认能抓住 bug：去掉 `registeredCalls` 派发 → **5 项变红**；恢复抢跑起播 → **3 项变红**
+
+### 本轮测试配置
+`GaplessPlayer-0.1.3` 单独启用；`LibFrontendPlay-1.1.0` 与 `CallTrace-0.3.0` 停用（减少变量）。
+
+## v0.1.0 真机首测结果（✅ 音频链路全通）
+
+用户实测：一首 44.7MB FLAC 从头听到尾（220s），全程正常。
+
+| 环节 | 实测 |
+|---|---|
+| `channel.call` 锁定 | ✅ 全程无「有人想改写」 |
+| 取字节 | ✅ 44.74 MB / 2316ms（19 MB/s） |
+| 解码 | ✅ 327ms → 219.93s / 2ch @48000 / 80.54MB |
+| 起播 | ✅ `ctx.resume()` 成功（suspended → running） |
+| 进度推进 | ✅ 22 次心跳 3.1s → 213.1s，`ctx=running` |
+| 自然播完 | ✅ `onEnd` 触发 |
+| 自动切下一首 | ✅ 第二首 load → 解码 253ms → 起播 |
+
+**⚠️ 未验证：暂停。** 整份日志没有一条 `[cmd] ▶ pause` —— 用户没按过暂停按钮。
+A0 的核心问题（暂停能不能真的停住）**仍未回答**。
+
+**⚠️ 另一个观察：切歌之间空了 13.6 秒**（19:48:17.810 播完 → 19:48:31.404 起播）。
+拆开看是「网易云自己等了 9.1s 才发下一首的 load」+「下载解码 4.5s」。
+后者 A1 的预载能消掉；**前者原因不明**（怀疑网易云在等原生播放器的结束回报，
+而我们把它按住了），待查。
+
+### v0.1.1 的改动：命令追踪
+
+v0.1.0 只记「认识的」那几条命令 —— 如果网易云压根不发 `audioplayer.pause`，
+日志会一片安静，又回到「看不出是没发还是没接住」的死胡同。
+
+v0.1.1 起：
+- 每个**首次出现**的命令名都记一笔（`[call] 首次出现命令：xxx`，上限 200 种）
+- 名字里带 `player/audio/play/pause/seek/vol` 的命令**每次都记**，含参数与调用次数
+
+
+## 为什么要有这个插件
+
+网易云 PC 版原本的播放链是：
+
+```
+<audio> → createMediaElementSource → AnalyserNode → destination
+```
+
+`<audio>` 一次只能播一个源、也没法做采样级调度，所以**做不到真无缝**。
+早期的尝试是「提前点一下网易云的下一首按钮」来遮缝 ——
+这会真的推进播放列表索引，于是预载窗口里歌词和进度条提前跳、
+状态错乱，最终表现为「切歌后暂停失灵」这类修不好的毛病。
+GaplessPlayer 把这条路整个换掉了：不再借 UI 的手，自己排采样级接缝。
+
+**GaplessPlayer 把链条最前面那个 `<audio>` 换成 `AudioBufferSourceNode`：**
+
+```
+网易云 UI ── channel.call("audioplayer.*") ──▶ [拦截层]
+                                                ├─ 播放引擎（AudioBufferSourceNode）
+                                                ├─ GainNode → AnalyserNode → destination
+                                                └─ 事件伪造器（legacyNativeCmder）
+```
+
+这样播放的每一环都归我们管 —— **暂停 = `source.stop()`，不再依赖网易云发命令。**
+
+## 目录
+
+```
+src/main.js            插件主体（拦截 channel.call + 播放引擎 + 伪造事件）
+src/startup_script.js  页面最早期注入：建 registeredCalls、包注册接口
+src/manifest.json      插件清单（injects + hijacks）
+test/harness.js        离线验证台（假运行环境，跑一遍全部逻辑）
+test/mutate.js         变异测试（抠掉关键代码，验证台必须变红）
+build.py               打包 / 安装
+```
+
+## 构建与验证
+
+```bash
+node test/harness.js        # 离线验证台，必须全绿
+node test/mutate.js         # 变异测试，必须「全部变异都被抓住」
+python build.py --install   # 打包并安装到 C:\betterncm\plugins\
+```
+
+日志写在 `C:\betterncm\gapless-player.log`（900 条滚动窗口）。
+
+## 阶段范围
+
+**A0（已完成）**只验证两件事：① 接管播放后网易云的进度条 / 歌词 / 时长是否正常；② **暂停是否可用**。
+
+**A1（已完成）**：**预载下一首，消除第二首起每首开头的加载等待**（不做采样级无缝）。
+
+**A1.5（本版）**：**开机预下第一首**（含 `localStorage` 开机记忆），让第一首也能秒开。
+采样级无缝（`start(when)`）仍留到后面。
+
+### 已实现
+
+- 拦截 `channel.call`：`audioplayer.load` / `.play` / `.pause` / `.seek` / `.setVolume`
+- `fetch` → `decodeAudioData` → `AudioBufferSourceNode` 播放
+- 事件伪造：`onLoad` / `onPlayState` / `onPlayProgress` / `onSeek` / `onVolume` / `onEnd`
+- 100ms 进度心跳；10s 状态心跳（排查「UI 静悄悄崩了」）
+- 本地文件走 `betterncm.fs.readFile`
+- 下载失败也发 `onLoad`（带错误码），否则网易云会一直转圈
+- `channel.call` 用 `defineProperty` 锁住，防止 LFP 抢回去
+- 接管 `betterncm_native.audio.getFFTData` 与 `betterncm.isMRBNCM`
+- **自建 `registeredCalls`**（`startup_script.js` + manifest `hijacks` + 运行时兜底）
+- **A1 预载**：旁听播放列表 / 当前曲目 → 查下一首地址（`LibEAPIRequest`）→ 下完 + 解码 → 切歌命中
+- **A1.5 开机预载**：预载规则两条（当前曲目未就绪 → 预载它自己；已在播 → 预载下一首）；
+  记住上次播放的那首（24h 内有效，**存文件** `C://betterncm//gapless-player.lasttrack.json`，
+  `localStorage` 只作备份），开机（onLoad）就先猜着下起来
+
+### 已知取舍
+
+- **和 LFP 的关系**：manifest 用 `loadAfter: ["LibFrontendPlay"]`，若用户装了 LFP，本插件的拦截器
+  就装在它之上，`audioplayer.*` 全部截断，LFP 收不到 → 变成惰性。两边都装着也不会打架；
+  没装 LFP 同样正常工作（本插件不依赖它）。
+- **开机第一首能否秒开，取决于「3.1 秒窗口」够不够**：真机时序上 `onLoad` → `setCurrentPlay`
+  有 ~1.7s、→ `audioplayer.load` 有 ~4.8s 提前量。网络慢（一首要下 5s+）时第一首仍可能等。
+  第二首起由「上一首播放期间」预载，窗口长得多，基本稳定命中。
+  （根因：`decodeAudioData` 必须拿到完整文件，不像 `<audio>` 可以边下边播。）
+- **开机记忆只是「猜」**：猜错会白下一份（`setCurrentPlay` 一到就被 token 换掉，不影响播放）。
+  记忆**属于某一份歌单**：切到不含这首歌的新歌单时，预载会被自动作废（v0.2.4）。
+  ⚠️ 记忆**不能存 `localStorage`**：NetEase 的 webview 里它是异步落盘，强杀进程会丢最近写入
+  （真机踩过：记忆停在「第一次 flush 出去的值」，时间戳一起冻住）→ 必须写文件。
+- **预载依赖 `LibEAPIRequest`**：它不在 / 查不到地址 → 退回即时加载（功能降级，不会出错）。
+- **`decodeAudioData` 会 detach 传入的 ArrayBuffer**（长度归零、`.slice()` 抛错）。
+  本插件不需要保留原始字节，所以无影响。
+- **内存**：每首解码后 63~80MB（float32）。A1 预载时要注意释放旧 buffer。
+- **Worker 用不了**：`blob:` 和 `data:` 都被页面 CSP 禁。好在解码是异步的，主线程不卡。
+
+## ★★ v0.1.1 二测：暂停完全没反应 —— 根因找到并修复（v0.1.2）
+
+用户实测（当时 LFP 与同类的早期插件均已停用）：
+
+| 现象 | 日志证据 |
+|---|---|
+| 按两次暂停都没反应 | **整份日志没有任何 `audioplayer.pause`**，连「首次出现命令」都没有 |
+| 进度条一直转圈 | 网易云认为歌曲「还在加载」 |
+| 时间显示 `00:00 / 00:00` | 同上 |
+| 点播放卡一会 | 首次要下载 3.2s + 解码 243ms（预期内） |
+| 重启不回到上次位置 | 我们 `onEnd` 的 `playedTime` 一直填 0 |
+
+**根因**：从 LFP 插件包里挖出它的进度心跳原文 ——
+
+```js
+function rN(){
+  if (!N.currentAudioPlayer || !N.enabled || N.currentAudioPlayer.buffered.length === 0) return;
+  let e = N.currentAudioPlayer.buffered.end(0) / N.currentAudioPlayer.duration;  // ← 加载进度 0~1
+  N.info.playProgress !== N.currentAudioPlayer.currentTime && (
+    N.info.loadProgress = e,
+    mo("audioplayer.onPlayProgress", N.currentAudioId[0], N.currentAudioPlayer.currentTime, e)
+  );
+}
+```
+
+★ **`onPlayProgress` 的第 3 个参数是「加载进度（0~1）」，不是占位符。**
+我们一直发 `0` → 网易云以为「这首歌一点都没缓冲好」→
+**进度条一直转圈 + 暂停按钮不干活（压根不发命令）+ 时间显示 00:00**。
+一个根因，三个现象。
+
+### v0.1.2 的修复
+
+1. `onPlayProgress` 第 3 参数发 **`1`**（我们是整首解码完才播的，永远完全加载）
+2. 照 LFP 的做法：**位置没变就不发**进度（暂停时自然不发）
+3. `playedTime` 改成**真实累计播放毫秒数**（照 LFP：play 起表、pause 停表、
+   `onEnd` 带上总值再清零）—— 只算真正在播的时间，暂停期间不计
+
+### 仍未解决
+
+- **「重启回到上次播放位置」**：这多半是**原生播放器**自己的功能，
+  我们绕过了它 → 大概率修不了，属于已知代价。待确认。
+- **切歌之间空 13.6 秒**（网易云自己等 9.1s 才发下一首 load）—— 原因仍未查明。
+
+## A0 真机测试步骤
+
+1. **停用同类做无缝的插件**（必须）—— 会和本插件打架，现象无法归因。
+2. **建议也停用 `LibFrontendPlay`**（见下）—— 不是必须，但 A0 是诊断跑，少一个变量。
+3. 重启网易云 → 播一首歌 → 看日志 `C:\betterncm\gapless-player.log`。
+
+### 关于「要不要停用 LFP」
+
+**严格来说不必须。** manifest 的 `loadAfter: ["LibFrontendPlay"]` 让我们的拦截器装在 LFP 之上，
+`audioplayer.*` 全部截断；而且 `channel.call` 用 `Object.defineProperty` 锁住，
+LFP 的 React `useEffect` 就算想把 `channel.call` 抢回去也会被 setter 吞掉。
+
+**但 A0 建议一起停用**，因为：
+
+- LFP 的 `useEffect` 触发时机（React 调度）与我们的 `plugin.onLoad` 谁先谁后，
+  **我没有在真机上验证过**，`defineProperty` 万一不可用就会退化成普通赋值，LFP 可能抢赢；
+- A0 是诊断跑，出问题时最好只有「我们的 bug」一种可能，而不是「谁抢赢了」；
+- 日志里出现 `[guard] 有人想改写 channel.call，已拦下` 就说明 LFP 确实在抢 —— 这条日志
+  本身就是验证「共存设计是否成立」的证据。
+
+A0 跑通之后，如果想验证「能不能和 LFP 共存」，把 LFP 打开再跑一次即可。
+
+## 关键参考：LFP 的实现蓝图
+
+`C:\betterncm\plugins_runtime\LibFrontendPlay\index.js`（345KB 打包产物，变量名未混淆）
+是本插件的施工图。要点：
+
+- 全部拦截面只有 **4 条命令 + 6 个事件**
+- 伪造事件的秘诀就 3 行：
+  ```js
+  function mo(event, ...args) {
+    registeredCalls[event].map(f => f(...args));
+    let [r, o] = event.split(".");
+    legacyNativeCmder.triggerRegisterCall(o.slice(2), r, ...args);
+  }
+  ```
+- 启动时要先 `channel.call("audioplayer.pause", ()=>{}, ["",""])` 按住原生播放器，否则双声道
+
+## 下一步
+
+- **A1.6 真无缝**：预载已就位，把「命中后立刻起播」升级成 `start(when)` 采样级接缝
+  （当前歌还剩 N 秒时，下一首 source 预约在接缝时刻起播，两段音频首尾零缝隙）
+- **A2 控制面**：seek / 上一首 / 下一首 / 音量 / 播放模式（含随机 / 单曲循环下的预载正确性）
+- **A3 打磨**：编码器延迟裁剪（MP3 priming/remainder）、格式不一致回退、内存回收、预载失败重试
